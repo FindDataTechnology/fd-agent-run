@@ -20,6 +20,40 @@ python3 -m fd_agent_run.cli resume --run <id>
 
 台账落在被检查项目的 `.run/<run_id>/` 下（随项目拷走，自包含）。
 
+## 未执行：一个任务可能被"决定不跑"
+
+图上的条件分支意味着有些任务**不会被尝试**。这不是失败，也不是完成——折进任何一边都会
+让台账撒谎：算完成等于认领了没做的工作，算失败等于把设计的绕行报成缺陷。所以它是自己的
+状态，且只接受三个原因：
+
+```bash
+# 写入必须带原因；集合外的状态与原因都会被拒
+python3 -m fd_agent_run.cli record --run <id> --task <id> \
+    --state not_executed --reason when_false
+```
+
+| 原因 | 含义 |
+|---|---|
+| `when_false` | 守卫求值为假：这个分支这次不走 |
+| `when_unknown` | 守卫引用的决策没有结算，真假不可知（**不是**假） |
+| `upstream_not_executed` | 它的图内依赖全部未执行 |
+
+`not_executed` 是终态：没有后续迁移，`resume` 也不会重新排队（连同 `committed` 一起跳过）。
+`status` 的计数把它单列，它既不在完成数里，也不在失败数里。
+
+### 从图运行落账：`apply-record`
+
+`fd-agent-graph run` 会写一份 `*.dispatch.json`。这个命令把它折进台账：
+
+```bash
+python3 -m fd_agent_run.cli apply-record --dir <project> --run <id> \
+    --record <graph>.dispatch.json
+```
+
+两条纪律：**节点没有对应任务时只报告、不编造地址**（编出来的地址无法续跑，下一个进程会去
+找不存在的任务）；**已经是终态的任务不重写**（一个任务不能有两个结局）。记录里没有
+`outcomes` 时直接拒绝——那只说明它记的是裁决，不是一次运行。
+
 ## 投影到事件库（可选的读面）
 
 台账是**唯一真源**；下面的库只是它的投影，删了能重放出来。投影器不参与台账写入。
