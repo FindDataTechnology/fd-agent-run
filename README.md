@@ -178,3 +178,28 @@ kubectl -n fd-prod exec <pod> -c platform -- \
 
 实测（2026-11-14，dry-run，未写生产）：三个中招 cell 共 15 组 / 22 个回合，
 与 `check_cell_daily.mjs` 和改过口径的 `sql/005` 三处一致。
+
+## 线上视图是否真的换了口径（`tools/check_view_drift.py`）
+
+```bash
+FD_AGENT_RUN_DSN=... python3 tools/check_view_drift.py      # EXIT=1 即有性质缺失
+```
+
+「仓里改了 SQL」不等于「线上视图变了」。`sql/*.sql` 是 `create or replace view`，
+没人用 DDL 角色跑一遍，线上就还是旧定义——板面照旧按旧口径出数，而任何翻文件、
+看测试的人都会以为已经修好。2026-11-14 就是这么过的：`005` 改完、单测全绿，
+线上 `agent_run_gap` 仍按 `ended_at` 归日。
+
+**判据是性质，不是文本。** 第一版把 `pg_get_viewdef()` 的正文与仓里 SQL 逐字比，
+5 个视图全报漂移，其中 3 个根本没改过——`pg_get_viewdef()` 会去别名、重排括号、
+补 `::text`、把 `IN (a,b)` 写成 `= ANY (ARRAY[a,b])`、吃掉 `'x'as y` 里的空格。
+靠正则逐步归一化等于手写一个 SQL 解析器：抹少了假红，抹多了把真变化一起抹掉。
+现在只断言四条**有过事故**的性质（归日字段 / skipped 不进事实 / `$unknown` 在场 /
+`is_defect` 在场），加列、换别名、调排版都不会红。
+
+修法：用有 DDL 权限的角色在一个事务里跑 `sql/00X…`（`DROP`+`CREATE` 原子替换，
+不留半旧半新的可见窗口），再跑一次本体检。
+
+2026-11-14 已按此法把 `005_completeness.sql` 部署到生产，四处性质全绿；实测读数
+与只读复算、cell 侧自证三处吻合：`archive_gap 11/16`、`daily_absent 4/6`
+（此前 `daily_exceeds_events` 那 23 对跨日界假缺陷归零）。
