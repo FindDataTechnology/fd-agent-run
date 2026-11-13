@@ -331,6 +331,30 @@ def cmd_record(args: argparse.Namespace) -> int:
         if isinstance(item, dict) and "cmd" in item and "cmd_observed" not in item:
             item["cmd_observed"] = True
 
+    if args.state == st.NOT_EXECUTED:
+        # Its own door: not_executed must carry a reason, and it is not a
+        # completion, so it must not travel through the evidence gate.
+        try:
+            _wired_transition(args.task, task.state, st.NOT_EXECUTED)
+            st.check_reason(args.task, args.reason or "")
+        except st.TransitionError as exc:
+            print(f"refused: {exc}", file=sys.stderr)
+            return 1
+        journal.append(
+            project,
+            args.run,
+            {"kind": "task_not_executed", "task": args.task, "node": task.node,
+             "attempt": task.attempt, "reason": args.reason},
+        )
+        vw.write_snapshot(vw.rebuild(project, args.run))
+        _emit(
+            {"run": args.run, "task": args.task, "state": st.NOT_EXECUTED,
+             "reason": args.reason,
+             "lines": [f"{args.task} -> not_executed ({args.reason})"]},
+            args.json,
+        )
+        return 0
+
     if args.state == st.PRODUCED:
         # R6: a closed state set is only closed where writes happen.
         _wired_transition(args.task, task.state, st.PRODUCED)
@@ -484,7 +508,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
     requeued: list[str] = []
     skipped: list[str] = []
     for task in sorted(before.tasks.values(), key=lambda t: t.task):
-        if task.state == st.COMMITTED:
+        if task.state in (st.COMMITTED, st.NOT_EXECUTED):
             # I3: committed work is the checkpoint. Re-running it would both waste
             # the work and risk double-writing what is already a fact.
             skipped.append(task.task)
@@ -510,6 +534,29 @@ def cmd_resume(args: argparse.Namespace) -> int:
     for t in requeued:
         lines.append(f"  + {t}")
     _emit({"run": args.run, "skipped": skipped, "requeued": requeued, "lines": lines}, args.json)
+    return 0
+
+
+# ------------------------------------------------------------ dispatch records
+
+
+def cmd_apply_record(args: argparse.Namespace) -> int:
+    """Fold a graph dispatch record into this run's journal."""
+    from . import dispatch_adapter as da
+
+    project = Path(args.dir).resolve()
+    try:
+        result = da.apply_record(project, args.run, Path(args.record))
+    except da.DispatchAdapterError as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return 1
+    vw.write_snapshot(vw.rebuild(project, args.run))
+    lines = [
+        f"applied {len(result['applied'])} not-executed outcome(s) from {result['graph'] or 'record'}",
+    ]
+    for item in result["skipped"]:
+        lines.append(f"  - skipped {item.get('node')}: {item.get('reason')}")
+    _emit({**result, "lines": lines}, args.json)
     return 0
 
 
@@ -714,7 +761,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("record", help="record produced/failed with evidence")
     p.add_argument("--task", required=True)
-    p.add_argument("--state", required=True, choices=[st.PRODUCED, st.WORKING, st.PREDICATE_FAILED, st.ABANDONED])
+    p.add_argument(
+        "--state",
+        required=True,
+        choices=[st.PRODUCED, st.WORKING, st.PREDICATE_FAILED, st.ABANDONED, st.NOT_EXECUTED],
+        help="not_executed requires --reason (when_false / when_unknown / upstream_not_executed)",
+    )
     p.add_argument("--evidence", action="append", help="JSON file with evidence (object or list), repeatable")
     p.add_argument("--reason", default="")
     common(p)
@@ -740,6 +792,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="<kind>:<path>, repeatable; kinds: crew (journal.jsonl), crawl (health report)")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_escalations)
+
+    p = sub.add_parser(
+        "apply-record",
+        help="fold a graph dispatch record's not-executed outcomes into this run",
+    )
+    p.add_argument("--record", required=True, help="path to a *.dispatch.json")
+    common(p)
+    p.set_defaults(func=cmd_apply_record)
 
     p = sub.add_parser("resume", help="re-queue unfinished work, skip committed")
     common(p)

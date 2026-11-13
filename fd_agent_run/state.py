@@ -38,6 +38,22 @@ PRODUCED: Final = "produced"
 COMMITTED: Final = "committed"
 PREDICATE_FAILED: Final = "predicate_failed"
 ABANDONED: Final = "abandoned"
+#: A task a graph's routing decided not to run. Its own state, because folding it
+#: into either "done" or "failed" answers a question nobody asked: the work was
+#: not attempted, and calling that failure would make every approval branch look
+#: like a defect.
+NOT_EXECUTED: Final = "not_executed"
+
+#: And only three reasons, because "not executed" without a reason is the same
+#: ambiguity this state exists to remove.
+REASON_WHEN_FALSE: Final = "when_false"
+REASON_WHEN_UNKNOWN: Final = "when_unknown"
+REASON_UPSTREAM_NOT_EXECUTED: Final = "upstream_not_executed"
+REASONS: Final = (
+    REASON_WHEN_FALSE,
+    REASON_WHEN_UNKNOWN,
+    REASON_UPSTREAM_NOT_EXECUTED,
+)
 
 STATES: Final = (
     PENDING,
@@ -47,24 +63,28 @@ STATES: Final = (
     COMMITTED,
     PREDICATE_FAILED,
     ABANDONED,
+    NOT_EXECUTED,
 )
 
 #: Terminal states accept no further transition except the explicit re-queue that
 #: ``resume`` performs on a *new attempt* (which is a different task address, so
 #: the old task stays terminal forever — that is the point of addressing attempts).
-TERMINAL: Final = (COMMITTED, ABANDONED)
+TERMINAL: Final = (COMMITTED, ABANDONED, NOT_EXECUTED)
 
 ALLOWED: Final[dict[str, frozenset[str]]] = {
     # `produced` straight from `pending`: this CLI's dispatch (`next`) is a query,
     # so a run's first recorded event is the produced report. `leased`/`working`
     # remain available for executors that want to record progress.
-    PENDING: frozenset({LEASED, WORKING, PRODUCED, ABANDONED}),
+    PENDING: frozenset({LEASED, WORKING, PRODUCED, ABANDONED, NOT_EXECUTED}),
     LEASED: frozenset({WORKING, PENDING, ABANDONED}),
     WORKING: frozenset({PRODUCED, PREDICATE_FAILED, PENDING, ABANDONED}),
     PRODUCED: frozenset({COMMITTED, PREDICATE_FAILED}),
     PREDICATE_FAILED: frozenset({PRODUCED, PENDING, ABANDONED}),
     COMMITTED: frozenset(),
     ABANDONED: frozenset(),
+    # Not executed is a settlement, not a pause: a later attempt is a new task
+    # address, exactly as re-queueing a committed task would be.
+    NOT_EXECUTED: frozenset(),
 }
 
 
@@ -104,3 +124,12 @@ def check_transition(task: str, current: str | None, target: str) -> None:
 
 def is_terminal(state: str) -> bool:
     return state in TERMINAL
+
+
+def check_reason(task: str, reason: str) -> None:
+    """A not-executed write must carry one of the three reasons, and nothing else."""
+    if reason not in REASONS:
+        raise TransitionError(
+            f"{task}: not_executed needs a reason, one of {', '.join(REASONS)}; "
+            f"got {reason!r}"
+        )

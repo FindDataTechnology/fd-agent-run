@@ -110,6 +110,9 @@ def rebuild(project: Path, run_id: str) -> RunView:
             tv.state = st.COMMITTED
             if event.get("evidence"):
                 tv.evidence = list(event["evidence"])
+        elif kind == "task_not_executed":
+            tv.state = st.NOT_EXECUTED
+            tv.reason = str(event.get("reason") or "")
         elif kind == "task_abandoned":
             tv.state = st.ABANDONED
             tv.reason = str(event.get("reason") or "")
