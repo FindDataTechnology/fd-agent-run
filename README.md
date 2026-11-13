@@ -111,3 +111,26 @@ python3 -m fd_agent_run.cli facts --source crawl:../fd-industry-data/reports/<re
 substrate；`unknown` 是一等值（`$unknown`），**不是** `""`、`[]` 或 `0`。
 判据的 `declared_at` 必须早于任务开始 —— 事后补写的判据会被判为事后合理化。
 
+
+### 修复：从明细重建日汇总（`tools/rebuild_cell_daily.mjs`，默认空跑）
+
+```bash
+kubectl -n fd-prod exec <pod> -c platform -- \
+  node /tmp/rebuild_cell_daily.mjs --cell <hex>            # 只打印要补什么
+… --apply                                                  # 真写：整组重建
+… --apply --create-missing                                 # 连「整表缺席」也建（须显式）
+```
+
+三条口径/安全约束（每一条都有实历）：
+
+1. **按 `(member, day)` 比对，不能按 `model` 逐键**。同一回合在明细与汇总里的
+   `model` 归属可能不同（实测多条明细 `model=NULL` 而汇总里是具体型号）。第一版
+   按 model 逐键比，报出 434 处「少记」，真实缺口只有 15 处。
+2. **只补不减**。反方向（汇总 > 明细）通常是明细被剪枝，此时绝不碰——用被剪枝的
+   明细覆盖永久真相等于抹掉证据。
+3. **整表缺席要单独显式**。`420a3344…`、`de7ec3a6…` 从来没有过任何日汇总行；
+   把「没有起始日」当成「上线前正常」会把最坏的一类（`daily_absent`）藏起来。
+   重建这类等于用「存活下来的明细」当全部历史，所以必须显式 `--create-missing`。
+
+实测（2026-11-14，dry-run，未写生产）：三个中招 cell 共 15 组 / 22 个回合，
+与 `check_cell_daily.mjs` 和改过口径的 `sql/005` 三处一致。
