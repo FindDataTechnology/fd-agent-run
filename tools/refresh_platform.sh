@@ -60,21 +60,58 @@ fi
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/refresh-platform.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 
+# 解释器：优先 FD_PYTHON，其次 finddata 的 micromamba（实测带 psycopg 3），最后 python3。
+# 不写死 /tmp 下的 venv —— 那东西重启就没了，而这是要挂定时器的脚本。
+PY="${FD_PYTHON:-}"
+if [ -z "$PY" ]; then
+  for cand in /Users/chengsishi/micromamba/bin/python3 python3; do
+    if "$cand" -c 'import psycopg' >/dev/null 2>&1; then PY="$cand"; break; fi
+  done
+fi
+if [ -z "$PY" ]; then
+  echo "FATAL: 找不到带 psycopg 的 python（用 FD_PYTHON 指定）" >&2
+  exit 2
+fi
+
+# 导出器每次重新拷进去：pod 会重启（本会话实测一小时内两次），/tmp 里的东西不留。
+# 拷失败就等于没有导出器，直接停，别拿着上一次留下的旧脚本跑。
+HERE=$(cd "$(dirname "$0")" && pwd)
+if ! kubectl --context "$CTX" -n "$NS" cp "$HERE/export_platform.mjs" \
+       "$POD:/tmp/export_platform.mjs" -c platform >/dev/null 2>&1; then
+  echo "FATAL: 无法把 export_platform.mjs 拷进 $POD（pod 刚重启？）" >&2
+  exit 2
+fi
+
 fail=0
 total_absorbed=0
 for cell in $CELLS; do
   out="$WORK/$cell.jsonl"
-  # pod 内 gzip → 管道 → 本地落盘（绕开单次 cp 的截断上限）
+  # 该 cell 已吸收到的最大 seq → 只导更新的行。
+  # 不这么做的话，表一加列就让**每一行**的指纹变化，投影器按契约拒绝重写历史
+  # （2026-11-14 实测：cell 的行从 38 键变 40 键，四个 cell 立刻 REFUSED）。
+  after=$("$PY" -c "
+import os, psycopg, sys
+cell = sys.argv[1]
+with psycopg.connect(os.environ['FD_AGENT_RUN_DSN'], connect_timeout=10) as c, c.cursor() as cur:
+    cur.execute('select coalesce(max(seq),0) from agent_runs.agent_run_event where run_key like %s',
+                ('platform|cell:' + cell + '|%',))
+    print(cur.fetchone()[0])
+" "$cell")
+  [ -z "$after" ] && after=0
+  # pod 内 gzip → 管道 → 本地落盘（绕开单次 cp 的截断上限）。
+  # **不能**写成 `node … | gzip`：管道的退出码取的是最后一个命令，node 崩了也会被
+  # 当成成功，于是拿到一个 0 行的空导出、投影器报 "empty export"、脚本却报 OK。
+  # 所以先落文件再压缩，显式 && 串起来。
   if ! kubectl --context "$CTX" -n "$NS" exec "$POD" -c platform -- \
-        sh -lc "cd /app && node /tmp/export_platform.mjs --cell $cell --since $SINCE 2>/dev/null | gzip -c" \
-        > "$out.gz" 2>/dev/null; then
-    echo "  FAIL $cell: 导出失败"; fail=1; continue
+        sh -lc "cd /app && node /tmp/export_platform.mjs --cell $cell --since $SINCE --after-id $after > /tmp/exp.jsonl && gzip -c /tmp/exp.jsonl" \
+        > "$out.gz" 2>"$WORK/$cell.err"; then
+    echo "  FAIL $cell: 导出失败 — $(tail -2 "$WORK/$cell.err" | tr '\n' ' ')"; fail=1; continue
   fi
   gzip -dc "$out.gz" > "$out" || { echo "  FAIL $cell: 解压失败"; fail=1; continue; }
 
   args=(--export "$out")
   [ "$APPLY" -eq 0 ] && args+=(--dry-run)
-  stats=$(/tmp/fdpg/bin/python -m fd_agent_run.cli project "${args[@]}" 2>&1)
+  stats=$("$PY" -m fd_agent_run.cli project "${args[@]}" 2>&1)
   rc=$?
   echo "  $stats"
   if [ $rc -ne 0 ]; then fail=1; fi

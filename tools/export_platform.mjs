@@ -47,7 +47,8 @@ if (!cell) {
 }
 const dbPath = arg("db", `/data/cells/${cell}/data/data/fleets.db`);
 const outPath = arg("out");
-const since = arg("since"); // 可选 YYYY-MM-DD，仅按 started_at 过滤 turn
+const since = arg("since");       // 起始日（YYYY-MM-DD），按 started_at 的 UTC 日
+const afterId = arg("after-id");  // 只导 id > N 的明细：增量刷新用，见下
 
 const db = new Database(dbPath, { readonly: true, fileMustExist: true });
 db.pragma("query_only = true");
@@ -67,9 +68,13 @@ emit({
   exported_at: new Date().toISOString(),
   source_db: dbPath,
   since: since || null,
+  after_id: afterId ? Number(afterId) : null,
   counts,
   // 明确写下「没有截断」，让读导出的人不必猜
   truncated: false,
+  // 过滤过就是「部分」：投影端据此跳过「水位 > 台账长度」的失效判据，
+  // 并且不给本次没有新行的 run 写水位（那会被读成「从没见过」）。
+  partial: Boolean(since || afterId),
 });
 
 for (const row of db.prepare(
@@ -78,12 +83,22 @@ for (const row of db.prepare(
   emit({ k: "run", ...row });
 }
 
-const turnSql = since
-  ? `select * from member_turn_events
-     where date(started_at / 1000, 'unixepoch') >= ?
-     order by id`
-  : `select * from member_turn_events order by id`;
-for (const row of db.prepare(turnSql).iterate(...(since ? [since] : []))) {
+// ── 为什么必须有 --after-id ───────────────────────────────────────────────
+// 投影器对同一 `(run_key, seq)` 的判据是「内容指纹相同则跳过、不同则拒绝」。
+// 而指纹算的是**整行**，于是表结构一旦加列（实测 2026-11-14：cell 的行从 38 键
+// 变成 40 键，多出 trace_turn_id / usage_input_max），**历史上每一行都变成
+// 「与已吸收的不同」**，重发即被拒绝。这不是数据被改写，是契约与 schema 演进相撞。
+// 所以增量刷新必须按自增 id 只取**新行**，绝不重发老行：老行在库里是当时那份快照，
+// 让它保持原样，比用新形状覆盖它更诚实。
+const turnWhere = [];
+const turnParams = [];
+if (since) { turnWhere.push("date(started_at / 1000, 'unixepoch') >= ?"); turnParams.push(since); }
+if (afterId) { turnWhere.push("id > ?"); turnParams.push(Number(afterId)); }
+const turnSql = `select * from member_turn_events
+                 ${turnWhere.length ? `where ${turnWhere.join(" and ")}` : ""}
+                 order by id`;
+
+for (const row of db.prepare(turnSql).iterate(...turnParams)) {
   emit({ k: "turn", ...row });
 }
 

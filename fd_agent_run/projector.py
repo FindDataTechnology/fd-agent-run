@@ -335,9 +335,17 @@ def project_platform_export(path: Path, dsn: str, *, cell: str | None = None,
     if not objects:
         return {"cell": cell, "runs": 0, "turns": 0, "daily": 0, "note": "empty export"}
 
+    meta = next((o for o in objects if o.get("k") == "meta"), {})
     if cell is None:
-        meta = next((o for o in objects if o.get("k") == "meta"), {})
         cell = meta.get("cell") or Path(path).stem
+    # 部分导出（--since / --after-id）：只含**新增**行。它对「水位」有两个后果，
+    # 都必须挡住，否则增量刷新会把簿记弄坏：
+    #   ① 某个 run 这次没有新行 → 不能把它的水位写成 0（那是「从没见过」的意思）；
+    #   ② 「水位 > 台账长度 ⇒ 投影失效」这条判据在这里量纲都不对——水位是事件 id，
+    #      台账长度是条数；部分导出里 len(rows) 恒远小于 id，于是每次都误报失效
+    #      （2026-11-14 实测：16 个 cell 全报 [watermark invalid -> full replay]）。
+    # 全量导出（无过滤）仍然照旧判失效 —— 那条判据在一份完整台账上是有意义的。
+    partial = bool(meta.get("partial"))
     source = cell_source(cell)
 
     from . import crosswalk
@@ -432,7 +440,11 @@ def project_platform_export(path: Path, dsn: str, *, cell: str | None = None,
                     continue
                 headers.append((rk, "platform", source, run_id, h.get("started_at"),
                                 h.get("ended_at"), h.get("status"), h.get("stop_reason")))
-                if watermarks.get(run_id, 0) > len(rows):
+                if partial:
+                    # 部分导出：水位与「台账长度」无从比较，且没有新行的 run 不该被写
+                    if not rows:
+                        continue
+                elif watermarks.get(run_id, 0) > len(rows):
                     stats["invalidated"].append(run_id)
 
                 last_seq, last_hash = 0, None
