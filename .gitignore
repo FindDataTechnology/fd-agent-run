@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Test caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS
+.DS_Store
+._*
+
+# Local state: ledgers and databases are run artifacts, not source
+*.db
+*.sqlite3
+*.sqlite3-journal
+runs/
