@@ -81,6 +81,25 @@ python3 -m fd_agent_run.cli project --export /tmp/cell.jsonl
 = 6,693 / 7,512 / 4,167，与 cell 库计数逐一相等、零坏行；184 条回合没有 `run_id`
 （进 `__unassigned__`，不编造身份）。
 
+### 顺带自证：cell 的日汇总自己是否对得上（`tools/check_cell_daily.mjs`）
+
+```bash
+kubectl -n fd-prod exec <pod> -c platform -- \
+  node /tmp/check_cell_daily.mjs --cell <hex> [--since D] [--until D] [--verbose]
+# EXIT=1 即上线后仍有 (member, day) 的日汇总少于明细
+```
+
+为什么需要它：cell 的日汇总写入是 `try { … turns = turns + 1 … } catch (e) {
+meteringWarnOnce(…) }` —— **异常被吞、告警按消息去重只留一行、没有计数也没有重试**。
+事件行照样写成功，于是「明细有、汇总没有」这类损失除了事后对账没有任何信号。
+
+2026-11-14 实测 cell `1da519d4c1c0bf89`：**2026-11-03 少 16 个回合**，11 个成员各
+−1/−2，次日无反向补偿（所以不是归日口径问题，是真丢）。上线前的日子与上线当天
+分别归入 `not_enabled` / 部分启用，不计缺陷。
+
+口径：日汇总的 `day` = `new Date(startedAt)` 的 UTC 日（`fleets-db.js` 就是这么算的），
+明细也按 `started_at` 的 UTC 日归口——**不能**用 `ended_at`，否则跨日界回合会被误报。
+
 ## 跨 substrate 的事实层（只读）
 
 ```bash
