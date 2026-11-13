@@ -51,15 +51,24 @@ python3 -m fd_agent_run.cli project --dir <project> --all
 平台侧的数据在 cell 自己的 SQLite 里，不在我们这儿。导出 → 投影分两步，**两端都在仓里**：
 
 ```bash
-# ① 在 platform pod 内导出（DB 是 hostPath，只读打开）
+# 一条命令刷全部 cell（默认空跑；--apply 才写库）
+export FD_AGENT_RUN_DSN='postgresql://…'      # 必须是有写权限的角色
+tools/refresh_platform.sh                      # 昨天起增量，逐 cell 空跑
+tools/refresh_platform.sh --apply               # 真写
+tools/refresh_platform.sh --cells 1da5 3fdc --since 2026-11-10
+
+# 手工分步（调试用）
 kubectl -n fd-prod cp tools/export_platform.mjs <pod>:/tmp/ -c platform
 kubectl -n fd-prod exec <pod> -c platform -- \
-  node /tmp/export_platform.mjs --cell <hex> --out /tmp/cell.jsonl
-
-# ② 在这台机器上投影（需要写权限的 DSN）
-export FD_AGENT_RUN_DSN='postgresql://…'
-python3 -m fd_agent_run.cli project --export /tmp/cell.jsonl
+  node /tmp/export_platform.mjs --cell <hex> --since 2026-11-12 | gzip -c > /tmp/cell.jsonl.gz
+gunzip -c /tmp/cell.jsonl.gz > /tmp/cell.jsonl
+python3 -m fd_agent_run.cli project --export /tmp/cell.jsonl --dry-run
 ```
+
+调度器为什么在 pod 外：导出要读 cell 的 SQLite（在 pod 里），投影要写 Postgres
+（要写权限的 DSN）。两端都不在同一个网络域里，所以驱动脚本在本机跑、用管道把
+gzip 后的 JSONL 取回来（全量导出 ~11MB，两天增量 gzip 后 ~240KB，稳在 tailnet 单次
+传输的上限内）。
 
 **真库路径**：`/data/cells/<hex>/data/data/fleets.db`（`/data` 是节点上的 hostPath
 `/opt/platform`，不是 PVC，所以**换节点拿不到**；`/data/data/fleets.db` 是共享的那份，

@@ -87,7 +87,13 @@ for (const row of db.prepare(turnSql).iterate(...(since ? [since] : []))) {
   emit({ k: "turn", ...row });
 }
 
-for (const row of db.prepare(`select * from member_turn_daily order by day, member_id`).iterate()) {
+// 日汇总也按 --since 收窄：增量刷新时没必要每次搬全部历史。
+// 投影端是 upsert（按 (driver, source, fleet, member, carrier, provider, model, day)
+// 求聚后覆盖），所以只导最近几天是安全的、幂等的。
+const dailySql = since
+  ? `select * from member_turn_daily where day >= ? order by day, member_id`
+  : `select * from member_turn_daily order by day, member_id`;
+for (const row of db.prepare(dailySql).iterate(...(since ? [since] : []))) {
   emit({ k: "daily", ...row });
 }
 

@@ -682,7 +682,41 @@ def cmd_project(args: argparse.Namespace) -> int:
     run selected). The refusal is the point: a projection that overwrote would be
     a way to rewrite a run's history without touching the journal.
     """
-    project_dir = Path(args.dir)
+    project_dir = Path(args.dir) if args.dir else None
+
+    # 平台侧：`--export <jsonl>` 直接把一个 cell 的导出投影进库。
+    # 这条入口此前只能从 Python API 调（`project_platform_export`），于是日常刷新
+    # 只能靠临时脚本；README 里曾写成 `project --export …` 而 CLI 根本不认这个参数
+    # ——文档先行、实现没跟上，属于「写了就以为对」。现在两边对齐。
+    if args.export:
+        try:
+            dsn = proj.dsn_from_env(args.dsn_env)
+            stats = proj.project_platform_export(
+                Path(args.export), dsn, cell=args.cell, dry_run=args.dry_run)
+        except proj.ProjectionConflict as exc:
+            print(f"REFUSED {exc}", file=sys.stderr)
+            return 1
+        except proj.ProjectionError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if args.json:
+            print(json.dumps(stats, ensure_ascii=False, indent=1))
+        else:
+            flag = " (dry-run)" if stats.get("dry_run") else ""
+            invalid = " [watermark invalid -> full replay]" if stats.get("invalidated") else ""
+            print(f"cell {stats.get('cell')}: events={stats.get('turns')} "
+                  f"runs={stats.get('runs')} daily={stats.get('daily')} "
+                  f"absorbed={stats.get('absorbed')} skipped={stats.get('skipped')}"
+                  f"{invalid}{flag}")
+            for state, n in sorted((stats.get("unmapped_status") or {}).items()):
+                print(f"  WARN unmapped state {state!r} x{n} — recorded as unknown, "
+                      f"not guessed into a verdict")
+        return 0
+
+    if project_dir is None:
+        print("error: pass --dir <project> (crew side) or --export <file> (platform side)",
+              file=sys.stderr)
+        return 2
     run_ids = proj.discover_runs(project_dir) if args.all else ([args.run] if args.run else [])
     if not run_ids:
         print("error: pass --run <id> or --all", file=sys.stderr)
@@ -809,9 +843,11 @@ def build_parser() -> argparse.ArgumentParser:
         "project",
         help="project ledger(s) into the shared event store (idempotent; refuses rewrites)",
     )
-    p.add_argument("--dir", required=True, help="project directory holding .run/")
+    p.add_argument("--dir", help="project directory holding .run/ (crew side)")
     p.add_argument("--run", help="one run id; omit with --all")
     p.add_argument("--all", action="store_true", help="every run under .run/")
+    p.add_argument("--export", help="cell export JSONL (platform side) instead of a ledger")
+    p.add_argument("--cell", help="tenant id for --export; default: read from the export's meta line")
     p.add_argument("--source", help="holder identity; default project:<repo>@<host>")
     p.add_argument("--dsn-env", default="FD_AGENT_RUN_DSN",
                    help="env var holding the connection string (never a literal)")
