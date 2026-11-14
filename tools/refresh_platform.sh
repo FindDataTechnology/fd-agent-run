@@ -40,8 +40,21 @@ if [ -z "$SINCE" ]; then
   SINCE=$(date -u -v-1d +%Y-%m-%d 2>/dev/null || date -u -d 'yesterday' +%Y-%m-%d)
 fi
 
-POD=$(kubectl --context "$CTX" -n "$NS" get pods -l "$POD_LABEL" \
-        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+HERE=$(cd "$(dirname "$0")" && pwd)
+
+# pod 名不是常量：本会话实测一小时内换了两次（platform-5d794d888 → platform-9cb5dcb4b），
+# 多 cell 跑到一半时换掉的那次，剩下的 cell 全打在已死的 pod 上。所以**每个 cell 前
+# 重新解析**，并重新拷导出器（/tmp 里的东西不跨 pod 存活）。
+resolve_pod() {
+  kubectl --context "$CTX" -n "$NS" get pods -l "$POD_LABEL" \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null
+}
+copy_exporter() {
+  kubectl --context "$CTX" -n "$NS" cp "$HERE/export_platform.mjs" \
+    "$1:/tmp/export_platform.mjs" -c platform >/dev/null 2>&1
+}
+
+POD=$(resolve_pod)
 if [ -z "$POD" ]; then
   echo "FATAL: 在 $CTX/$NS 找不到 platform pod（label $POD_LABEL）" >&2
   exit 2
@@ -75,17 +88,25 @@ fi
 
 # 导出器每次重新拷进去：pod 会重启（本会话实测一小时内两次），/tmp 里的东西不留。
 # 拷失败就等于没有导出器，直接停，别拿着上一次留下的旧脚本跑。
-HERE=$(cd "$(dirname "$0")" && pwd)
-if ! kubectl --context "$CTX" -n "$NS" cp "$HERE/export_platform.mjs" \
-       "$POD:/tmp/export_platform.mjs" -c platform >/dev/null 2>&1; then
+if ! copy_exporter "$POD"; then
   echo "FATAL: 无法把 export_platform.mjs 拷进 $POD（pod 刚重启？）" >&2
   exit 2
 fi
 
 fail=0
-total_absorbed=0
 for cell in $CELLS; do
   out="$WORK/$cell.jsonl"
+
+  # 每个 cell 前刷新 pod + 导出器；失败重试一次（新 pod 起来要几秒）。
+  ready=0
+  for attempt in 1 2; do
+    POD=$(resolve_pod)
+    if [ -n "$POD" ] && copy_exporter "$POD"; then ready=1; break; fi
+    sleep 3
+  done
+  if [ "$ready" -eq 0 ]; then
+    echo "  FAIL $cell: 拿不到可用 pod（label $POD_LABEL，试了 2 次）"; fail=1; continue
+  fi
   # 该 cell 已吸收到的最大 seq → 只导更新的行。
   # 不这么做的话，表一加列就让**每一行**的指纹变化，投影器按契约拒绝重写历史
   # （2026-11-14 实测：cell 的行从 38 键变 40 键，四个 cell 立刻 REFUSED）。
@@ -109,6 +130,20 @@ with psycopg.connect(os.environ['FD_AGENT_RUN_DSN'], connect_timeout=10) as c, c
   fi
   gzip -dc "$out.gz" > "$out" || { echo "  FAIL $cell: 解压失败"; fail=1; continue; }
 
+  # 导出必须自带 meta，且 meta 里的 cell 对得上。
+  # pod 在导出途中被杀时，`sh -lc` 可能「成功」地写出半截或空文件；把它喂给投影器
+  # 只会得到一行全 0 的统计——读起来像「这个 cell 没有新数据」。2026-11-14 就这么
+  # 报过一次 `cell None: events=0 … absorbed=None`，而脚本末尾照样说「已写入。」。
+  meta=$(head -1 "$out" 2>/dev/null || true)
+  case "$meta" in
+    *'"k":"meta"'*) ;;
+    *) echo "  FAIL $cell: 导出缺 meta 头（空导出？）— $(printf '%s' "$meta" | cut -c1-100)"; fail=1; continue ;;
+  esac
+  case "$meta" in
+    *"\"cell\":\"$cell\""*) ;;
+    *) echo "  FAIL $cell: 导出 meta 的 cell 对不上 — $(printf '%s' "$meta" | cut -c1-100)"; fail=1; continue ;;
+  esac
+
   args=(--export "$out")
   [ "$APPLY" -eq 0 ] && args+=(--dry-run)
   stats=$("$PY" -m fd_agent_run.cli project "${args[@]}" 2>&1)
@@ -118,9 +153,15 @@ with psycopg.connect(os.environ['FD_AGENT_RUN_DSN'], connect_timeout=10) as c, c
 done
 
 echo "----"
+# 有任何一个 cell 失败，就**不能**在结尾说「已写入」——那句话会被读成整批成功，
+# 而实际可能是某几个 cell 一行都没进去（2026-11-14 实历）。
+if [ "$fail" -ne 0 ]; then
+  echo "有单元格失败（见上逐条 FAIL）。本次**不是**完整写入。"
+  exit 1
+fi
 if [ "$APPLY" -eq 0 ]; then
   echo "全部空跑完成（未写库）。要真写加 --apply。"
 else
   echo "已写入。"
 fi
-exit $fail
+exit 0
