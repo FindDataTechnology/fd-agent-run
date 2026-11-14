@@ -131,6 +131,20 @@ gzip 后的 JSONL 取回来（全量导出 ~11MB，两天增量 gzip 后 ~240KB�
 = 6,693 / 7,512 / 4,167，与 cell 库计数逐一相等、零坏行；184 条回合没有 `run_id`
 （进 `__unassigned__`，不编造身份）。
 
+### 心跳行 `__cell__`：投影表里那个不是 run 的 run_id
+
+`agent_runs.agent_run_projection` 里有一行 `run_id = '__cell__'`，**它不是一次 run**，
+而是「这条链路在某时刻确实跑通了、本次带进来 N 行」这个事实（`__unassigned__` 是同款
+保留名）。每次成功投影都会 upsert 它，`status` 分 `ok`（有新增行）/ `idle`（零新增）。
+
+为什么必须有它：覆盖面板用 `max(absorbed_at)` 判新鲜度，而水位行只在**有新增行**时
+更新。于是「链路每天跑通、只是这两天没有新回合」的承载者会在 2 个期望周期后判 `stale`，
+红的是没毛病的东西。有心跳之后三件事分开了：有数据 / 读通了但没新数据 / **流水线断了**
+（心跳过期）。板面把中间那档叫 `quiet`，不进 unhealthy。
+
+读者要各自过滤它：水位查询按 `(driver, source, run_id)` 精确匹配，天然不受影响；
+统计 run 数时排除它（`count(*) filter (where run_id <> '__cell__')`）。
+
 ### 顺带自证：cell 的日汇总自己是否对得上（`tools/check_cell_daily.mjs`）
 
 ```bash
