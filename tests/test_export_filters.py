@@ -52,12 +52,17 @@ def test_watermark_wins_over_the_calendar_window():
     assert got["turn_params"] == [7734]
 
 
-def test_backfill_without_a_watermark_uses_the_window():
-    """没有水位（首次/回填）时才由 `--since` 收窄，这是流量控制而非正确性。"""
+def test_backfill_without_a_watermark_is_full_not_windowed():
+    """没有水位（首次/回填）就全量导——日历窗口不是正确性边界。
+
+    这里曾经允许按 `--since` 收窄，代价是：连着两天没导成功的 cell，第一天的行
+    落在窗外、永久不导出。日汇总更直接：日历窗口让**永久镜像缺历史**，
+    2026-11-14 实测 `cell:1da5` cell 侧 4,659 行、镜像只有 837 行。
+    """
     got = explain("--since", "2026-10-01")
-    assert got["turn_filter_by"] == "since"
-    assert "date(started_at / 1000, 'unixepoch') >= ?" in got["turn_sql"]
-    assert got["turn_params"] == ["2026-10-01"]
+    assert got["turn_filter_by"] == "full"
+    assert "where" not in got["turn_sql"]
+    assert got["turn_params"] == []
 
 
 def test_no_filters_means_a_full_export():
@@ -73,11 +78,17 @@ def test_no_filters_means_a_full_export():
     assert got["partial"] is False
 
 
-def test_daily_still_narrowed_by_the_window_when_incremental():
-    """日汇总是 upsert（按 day 覆盖），日历窗口在那里是安全的省流量，保留。"""
+def test_daily_is_always_full():
+    """日汇总永远全量：upsert 保证幂等，但**不保证完整**。
+
+    按 `--since` 收窄时，从没导过的历史 day 永远不出现，永久镜像与 cell 总数对不上；
+    而归档缺口分析正是拿这张表比事件表，缺的行会被读成「cell 侧没有日汇总」——
+    一个由导出窗口造出来的假缺陷。表很小（最大 cell 4.6k 行），全量导的代价可忽略。
+    """
     got = explain("--since", "2026-11-13", "--after-id", "7734")
-    assert "member_turn_daily where day >= ?" in got["daily_sql"]
-    assert got["daily_params"] == ["2026-11-13"]
+    assert "where" not in got["daily_sql"], "日汇总又被窗口收窄了，镜像会对不上 cell 总数"
+    assert got["daily_params"] == []
+    assert got["daily_filter_by"] == "full"
 
 
 def test_explain_never_touches_the_database():

@@ -62,26 +62,35 @@ const afterId = arg("after-id");  // 只导 id > N 的明细：增量刷新用�
 // 驱动器每次都传 `--since 昨天`，而 N 个 cell 连挂两天时，第一天的新行在第三天
 // 的窗口外 ⇒ 永久跳过，且没有任何判据会红（导出照常成功、投影照常 absorbed=0）。
 // 而 `id > after` 本身就是「哪些行还没吸收」的精确答案，不需要日历帮忙。
-// 所以：给了 `--after-id` 就只用它；没给（首次/回填）才按 `--since` 收窄。
+// 所以：给了 `--after-id` 就只用它；没给（首次/回填）就全量导。
 const turnFilter = () => {
   if (afterId) return { sql: "id > ?", params: [Number(afterId)], by: "after-id" };
-  if (since) {
-    return {
-      sql: "date(started_at / 1000, 'unixepoch') >= ?",
-      params: [since],
-      by: "since",
-    };
-  }
   return { sql: null, params: [], by: "full" };
 };
 const turn = turnFilter();
-// 日汇总走 upsert（按 day 覆盖），日历窗口在这里是安全的省流量，保留。
-const dailySql = since
-  ? `select * from member_turn_daily where day >= ? order by day, member_id`
-  : `select * from member_turn_daily order by day, member_id`;
+
+// 日汇总**不再按日历收窄**。原先的理由是「upsert 按 day 覆盖，所以只导最近几天是安全的」
+// ——幂等成立，但日历窗口意味着「镜像能覆盖哪些天」取决于**每次跑批时它有多新**，
+// 而不是取决于台账里有什么。今天是齐的（实测 `cell:1da5` 镜像最早日 = cell 最早日 =
+// 2026-10-31），一旦遇到重建镜像、接入历史很久的新 cell、或跑批停过一段，
+// 窗口外的天就再也不会补上，而那张表正是归档缺口分析的基数——缺的行会被读成
+// 「cell 侧没有日汇总」，一个由导出窗口造出来的假缺陷。日汇总很小（最大 cell 4.6k 行），
+// 全量导的代价可忽略，所以宁可不留这个前提。
+//
+// 注意**行数不会相等，也不该相等**：这张表按 (fleet, member, carrier, provider, model, day)
+// 聚合，cell 侧 NULL 维度在那边是不同的行、在这里合并成一行。要验完整性就用
+// `sum(turns)` 与 `min/max(day)`，不要数行数（我第一版就是数行数，误报过一次）。
+const dailySql = `select * from member_turn_daily order by day, member_id`;
 const turnSql = `select * from member_turn_events
                  ${turn.sql ? `where ${turn.sql}` : ""}
                  order by id`;
+
+if (since) {
+  console.error(
+    `note: --since ${since} 已不再收窄任何表（明细按水位、日汇总全量）。` +
+    `日历窗口造出过两种静默缺陷：连挂两天丢第一天的新行、永久镜像缺历史日汇总。`
+  );
+}
 
 // `--explain`：只报「这次会按哪个判据导什么」，不碰库、不导数据。
 // 存在的理由是可测：本机没有 better-sqlite3，没有这个出口就只能靠读代码相信判据。
@@ -89,7 +98,7 @@ if (process.argv.includes("--explain")) {
   console.log(JSON.stringify({
     cell, db_path: dbPath, since: since || null, after_id: afterId ? Number(afterId) : null,
     turn_filter_by: turn.by, turn_sql: turnSql, turn_params: turn.params,
-    daily_sql: dailySql, daily_params: since ? [since] : [],
+    daily_sql: dailySql, daily_params: [], daily_filter_by: "full",
     partial: Boolean(since || afterId),
   }, null, 1));
   process.exit(0);
@@ -119,7 +128,10 @@ emit({
   truncated: false,
   // 过滤过就是「部分」：投影端据此跳过「水位 > 台账长度」的失效判据，
   // 并且不给本次没有新行的 run 写水位（那会被读成「从没见过」）。
-  partial: Boolean(since || afterId),
+  partial: Boolean(afterId),
+  // `--since` 曾经收窄过明细与日汇总，两种形态都造出过静默缺失；现在它只是一个
+  // 兼容参数，记下来是为了让复核的人知道「这份导出的过滤与应用无关」。
+  since_ignored: Boolean(since),
   // 明细到底按哪把判据导的（after-id / since / full）。写进导出本身，
   // 是因为 stderr 上的提示只在失败时才被人看见——而「这份导出跳过了一部分行」
   // 这件事，事后复核的人必须能从产物里读出来，不能靠猜。
@@ -156,7 +168,7 @@ for (const row of db.prepare(turnSql).iterate(...turn.params)) {
 // 日汇总也按 --since 收窄：增量刷新时没必要每次搬全部历史。
 // 投影端是 upsert（按 (driver, source, fleet, member, carrier, provider, model, day)
 // 求聚后覆盖），所以只导最近几天是安全的、幂等的。
-for (const row of db.prepare(dailySql).iterate(...(since ? [since] : []))) {
+for (const row of db.prepare(dailySql).iterate()) {
   emit({ k: "daily", ...row });
 }
 
