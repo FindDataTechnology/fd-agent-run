@@ -123,10 +123,26 @@ with psycopg.connect(os.environ['FD_AGENT_RUN_DSN'], connect_timeout=10) as c, c
   # **不能**写成 `node … | gzip`：管道的退出码取的是最后一个命令，node 崩了也会被
   # 当成成功，于是拿到一个 0 行的空导出、投影器报 "empty export"、脚本却报 OK。
   # 所以先落文件再压缩，显式 && 串起来。
-  if ! kubectl --context "$CTX" -n "$NS" exec "$POD" -c platform -- \
-        sh -lc "cd /app && node /tmp/export_platform.mjs --cell $cell --since $SINCE --after-id $after > /tmp/exp.jsonl && gzip -c /tmp/exp.jsonl" \
-        > "$out.gz" 2>"$WORK/$cell.err"; then
-    echo "  FAIL $cell: 导出失败 — $(tail -2 "$WORK/$cell.err" | tr '\n' ' ')"; fail=1; continue
+  #
+  # 导出是**只读且幂等**的，所以失败可重试。两类瞬时故障都命中过：
+  #   * pod 在这一格之前被换掉（重解析 + 重拷导出器）
+  #   * kube API `read: connection reset by peer`（2026-11-14 全量跑里有一格撞上）
+  exported=0
+  for attempt in 1 2 3; do
+    POD=$(resolve_pod)
+    if [ -z "$POD" ] || ! copy_exporter "$POD"; then
+      echo "  第 $attempt 次：拿不到可用 pod"; sleep 3; continue
+    fi
+    if kubectl --context "$CTX" -n "$NS" exec "$POD" -c platform -- \
+          sh -lc "cd /app && node /tmp/export_platform.mjs --cell $cell --since $SINCE --after-id $after > /tmp/exp.jsonl && gzip -c /tmp/exp.jsonl" \
+          > "$out.gz" 2>"$WORK/$cell.err"; then
+      exported=1; break
+    fi
+    echo "  第 $attempt 次导出失败，重试：$(tail -1 "$WORK/$cell.err" | cut -c1-120)"
+    sleep 3
+  done
+  if [ "$exported" -eq 0 ]; then
+    echo "  FAIL $cell: 导出失败（试了 3 次）— $(tail -2 "$WORK/$cell.err" | tr '\n' ' ')"; fail=1; continue
   fi
   gzip -dc "$out.gz" > "$out" || { echo "  FAIL $cell: 解压失败"; fail=1; continue; }
 
