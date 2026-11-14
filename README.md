@@ -135,7 +135,11 @@ gzip 后的 JSONL 取回来（全量导出 ~11MB，两天增量 gzip 后 ~240KB�
    全量导的代价可忽略。判据在 `export_platform.mjs::turnFilter()`，`--explain` 可直接看
    （在开库之前退出，本机无 npm 依赖也能跑），并写进 `meta.turn_filter_by` / `daily_filter_by`。
 
-**怎么验「镜像齐不齐」**：拿 cell 自己的总数比镜像，不要比两张自家表。
+**怎么验「镜像齐不齐」**：`python3 tools/check_mirror_completeness.py`
+（只读；`--self-test` 不连任何东西直接跑红/绿自证；EXIT=1 有 cell 对不上、
+EXIT=2 判不出——「什么都没查」不许读成「一个缺口都没有」）。
+它逐 cell 比 `cell 台账 vs 永久镜像`，判据是 `镜像 + 待吸收 == cell`，
+把「落后」与「丢了」分开。手工核对时同理：拿 cell 自己的总数比镜像，不要比两张自家表。
 **量词要对**——`agent_turn_daily` 是**聚合表**（按 fleet/member/carrier/provider/model/day
 合并，cell 侧 NULL 维度在那边是多行、在这里是一行），所以**行数本来就不相等**：
 `cell:1da5` 是 4,663 行 / 837 行。要验的是 `sum(turns)` 与 `min/max(day)`。
