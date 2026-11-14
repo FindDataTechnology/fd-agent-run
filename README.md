@@ -203,3 +203,28 @@ FD_AGENT_RUN_DSN=... python3 tools/check_view_drift.py      # EXIT=1 即有性�
 2026-11-14 已按此法把 `005_completeness.sql` 部署到生产，四处性质全绿；实测读数
 与只读复算、cell 侧自证三处吻合：`archive_gap 11/16`、`daily_absent 4/6`
 （此前 `daily_exceeds_events` 那 23 对跨日界假缺陷归零）。
+
+### 有些性质正则抓不住，只能真查（`BEHAVIOUR_CHECKS`）
+
+正则断言的是「定义文本里有没有这个词」。但有一类性质约束的是**视图算出来的东西**，
+文本里怎么看都对：
+
+- `enabled_from` 曾是 `min(day) WHERE source = 本 cell` —— **自指**。一个 cell 若从
+  第一天就漏记、第 N 天才恢复，它前面那些天会永久读成 `not_enabled`（「还没上线」），
+  一直漏看起来像还没上线，而闸是绿的。文本判据永远发现不了这件事。
+- 现在上线日单列成 `agent_run_ship_day` 视图：取「有 >30 天日汇总历史的 cell」里最早的
+  那天（本部署 = 2026-10-31）。为什么不取全体最早：我按明细补建的空壳 cell
+  （`420a3344` 3 天、`de7ec3a6` 1 天）会把上线日拽回 10-24，把两个活跃 cell 在
+  10-24…10-30「功能确实还没上」的 **1274 个回合**一次性翻成缺陷——假红比漏报更快
+  摧毁一道闸。
+- 配套新增 `late_start` 分诊类（上线日之后、但早于本 cell 第一行日汇总），**计入缺陷**；
+  `is_defect` 的豁免只剩 `not_enabled` / `partial_enable_day` 两类。
+
+三条行为判据（SQL 返回违反行数，0 = 通过）：
+`not_enabled` 里不许出现 ≥ `ship_day` 的行／`ship_day` 必须等于「>30 天 cell」里最早那天／
+`is_defect` 为假的只能有两类。**查不动就退 2**（判不出 ≠ 通过）——上线前
+`agent_run_ship_day` 不存在时，本闸报的是 `FATAL … 判不出`，而不是绿。
+
+实测：上产前后**零噪声**（`not_enabled` 264→263、`partial_enable_day` 28→29，
+只是 10-31 那一格挪了类），没有新增缺陷。
+

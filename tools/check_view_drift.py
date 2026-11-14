@@ -59,6 +59,49 @@ CHECKS = [
     ),
 ]
 
+#: 行为判据：(名字, 说明, 返回「违反行数」的 SQL, 违反时的后果)
+#: 有些性质正则**表达不了**——它们约束的是视图**算出来的东西**，不是定义文本，
+#: 只能真查一遍。每条 SQL 必须返回单个数，0 = 通过。
+BEHAVIOUR_CHECKS = [
+    (
+        "上线日不是自指的",
+        "not_enabled 里不许出现 ≥ 上线日（agent_run_ship_day）的行",
+        """
+        select count(*)
+        from agent_runs.agent_run_gap
+        where attribution = 'not_enabled'
+          and day >= (select ship_day from agent_runs.agent_run_ship_day)
+        """,
+        "某 cell 自己第一行日汇总被当成上线日 ⇒ 它若从第一天就漏记、第 N 天才恢复，"
+        "前面那些天会永久读成 not_enabled：一直漏看起来像还没上线，而闸是绿的"
+        "（2026-11-14 实测 cell 6db2b1b4b490223b 的日汇总从 11-04 才有、上线日是 10-31）",
+    ),
+    (
+        "上线日没被空壳 cell 拽跑",
+        "上线日必须等于「有 >30 天历史」的 cell 里最早那天，而不是全体最早",
+        """
+        select count(*)
+        from agent_runs.agent_run_ship_day
+        where ship_day is distinct from (select min(first_day) from (
+                select source, min("day") as first_day
+                from agent_runs.agent_turn_daily
+                group by 1 having count(*) > 30) s)
+        """,
+        "取全体最早会被补建的空壳 cell 拽回 10-24，把活跃 cell 功能上线前的 1274 个"
+        "回合翻成缺陷 —— 假红比漏报更快摧毁这道闸",
+    ),
+    (
+        "分诊不默认豁免",
+        "is_defect 为假的只能有 not_enabled / partial_enable_day 两类",
+        """
+        select count(*)
+        from agent_runs.agent_run_gap_summary
+        where not is_defect and attribution not in ('not_enabled', 'partial_enable_day')
+        """,
+        "新加的分诊类默认落进「不是缺陷」⇒ 真缺陷被静默豁免（late_start 就是这么加的）",
+    ),
+]
+
 
 def _live_definitions(dsn: str) -> dict[str, str]:
     import psycopg
@@ -70,6 +113,25 @@ def _live_definitions(dsn: str) -> dict[str, str]:
             where n.nspname = 'agent_runs' and c.relkind = 'v'
         """)
         return {name.lower(): (defn or "") for name, defn in cur.fetchall()}
+
+
+def _behaviour_results(dsn: str) -> list[dict]:
+    """真查一遍行为判据。查不动就抛，让上层按「判不出」处理（不是通过）。"""
+    import psycopg
+
+    out = []
+    with psycopg.connect(dsn, connect_timeout=10) as conn, conn.cursor() as cur:
+        for name, prop, sql, consequence in BEHAVIOUR_CHECKS:
+            cur.execute(sql)
+            violations = int(cur.fetchone()[0])
+            out.append({
+                "view": "(行为)",
+                "property": f"{name}：{prop}",
+                "state": "ok" if violations == 0 else "stale",
+                "detail": "" if violations == 0 else f"{violations} 行违反",
+                "consequence": consequence,
+            })
+    return out
 
 
 def main(argv: list[str]) -> int:
@@ -100,6 +162,14 @@ def main(argv: list[str]) -> int:
             rows.append({"view": view, "property": prop, "state": "stale",
                          "detail": "线上定义里找不到这条性质", "consequence": consequence})
 
+    # 行为判据：查不动 = 判不出（退 2），不能当成通过。正则抓不住自指类的问题，
+    # 所以这一类必须真跑。
+    try:
+        rows.extend(_behaviour_results(dsn))
+    except Exception as exc:            # noqa: BLE001
+        print(f"FATAL 行为判据查不动：{exc}（判不出 ≠ 通过）", file=sys.stderr)
+        return 2
+
     bad = [r for r in rows if r["state"] != "ok"]
     if args.json:
         print(json.dumps({"checks": rows, "stale": len(bad)}, ensure_ascii=False, indent=1))
@@ -109,12 +179,14 @@ def main(argv: list[str]) -> int:
             print(f"  {mark} {r['view']:26s} {r['property']}")
             if r["state"] != "ok":
                 print(f"      后果：{r['consequence']}")
+                if r["detail"]:
+                    print(f"      实测：{r['detail']}")
                 print(f"      修法：以有 DDL 权限的角色重建该视图（psql -f sql/00X…），再跑一次本体检")
         if bad:
-            print(f"\nFAIL {len(bad)} 条性质不在线上定义里 —— **线上跑的是旧视图**，"
+            print(f"\nFAIL {len(bad)} 条性质不成立 —— **线上跑的是旧视图或旧口径**，"
                   f"板面读数按旧口径算。「仓里改了」不等于「线上变了」。")
         else:
-            print("\nOK 全部关键性质都在线上定义里")
+            print("\nOK 全部关键性质都在线上成立（定义性质 + 行为性质）")
     return 1 if bad else 0
 
 
