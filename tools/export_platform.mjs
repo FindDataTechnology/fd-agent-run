@@ -32,8 +32,15 @@ import { createRequire } from "node:module";
 
 // ESM 不认 NODE_PATH，`import "better-sqlite3"` 在镜像里解析不到；
 // 用 createRequire 从应用根解析，pod 内 /app 就是 app 根。
+// **延迟到真要开库时再 require**：`--explain` 要在没有任何 npm 依赖的机器上
+// （比如本机 Python 测试里）也能跑，判据才可能被真正测到。
 const requireFromApp = createRequire("/app/");
-const Database = requireFromApp("better-sqlite3");
+function openDb(path) {
+  const Database = requireFromApp("better-sqlite3");
+  const db = new Database(path, { readonly: true, fileMustExist: true });
+  db.pragma("query_only = true");
+  return db;
+}
 
 function arg(name, fallback = null) {
   const i = process.argv.indexOf(`--${name}`);
@@ -50,8 +57,46 @@ const outPath = arg("out");
 const since = arg("since");       // 起始日（YYYY-MM-DD），按 started_at 的 UTC 日
 const afterId = arg("after-id");  // 只导 id > N 的明细：增量刷新用，见下
 
-const db = new Database(dbPath, { readonly: true, fileMustExist: true });
-db.pragma("query_only = true");
+// ── 两把过滤器谁说了算（这是本文件唯一的判据，单独抽出来以便复核）──────────
+// **水位优先，时钟窗口退位**。原因是一条真实的丢数路径：
+// 驱动器每次都传 `--since 昨天`，而 N 个 cell 连挂两天时，第一天的新行在第三天
+// 的窗口外 ⇒ 永久跳过，且没有任何判据会红（导出照常成功、投影照常 absorbed=0）。
+// 而 `id > after` 本身就是「哪些行还没吸收」的精确答案，不需要日历帮忙。
+// 所以：给了 `--after-id` 就只用它；没给（首次/回填）才按 `--since` 收窄。
+const turnFilter = () => {
+  if (afterId) return { sql: "id > ?", params: [Number(afterId)], by: "after-id" };
+  if (since) {
+    return {
+      sql: "date(started_at / 1000, 'unixepoch') >= ?",
+      params: [since],
+      by: "since",
+    };
+  }
+  return { sql: null, params: [], by: "full" };
+};
+const turn = turnFilter();
+// 日汇总走 upsert（按 day 覆盖），日历窗口在这里是安全的省流量，保留。
+const dailySql = since
+  ? `select * from member_turn_daily where day >= ? order by day, member_id`
+  : `select * from member_turn_daily order by day, member_id`;
+const turnSql = `select * from member_turn_events
+                 ${turn.sql ? `where ${turn.sql}` : ""}
+                 order by id`;
+
+// `--explain`：只报「这次会按哪个判据导什么」，不碰库、不导数据。
+// 存在的理由是可测：本机没有 better-sqlite3，没有这个出口就只能靠读代码相信判据。
+if (process.argv.includes("--explain")) {
+  console.log(JSON.stringify({
+    cell, db_path: dbPath, since: since || null, after_id: afterId ? Number(afterId) : null,
+    turn_filter_by: turn.by, turn_sql: turnSql, turn_params: turn.params,
+    daily_sql: dailySql, daily_params: since ? [since] : [],
+    partial: Boolean(since || afterId),
+  }, null, 1));
+  process.exit(0);
+}
+
+const db = openDb(dbPath);
+
 
 const out = outPath ? createWriteStream(outPath) : process.stdout;
 const emit = (obj) => out.write(JSON.stringify(obj) + "\n");
@@ -75,6 +120,10 @@ emit({
   // 过滤过就是「部分」：投影端据此跳过「水位 > 台账长度」的失效判据，
   // 并且不给本次没有新行的 run 写水位（那会被读成「从没见过」）。
   partial: Boolean(since || afterId),
+  // 明细到底按哪把判据导的（after-id / since / full）。写进导出本身，
+  // 是因为 stderr 上的提示只在失败时才被人看见——而「这份导出跳过了一部分行」
+  // 这件事，事后复核的人必须能从产物里读出来，不能靠猜。
+  turn_filter_by: turn.by,
 });
 
 for (const row of db.prepare(
@@ -90,24 +139,23 @@ for (const row of db.prepare(
 // 「与已吸收的不同」**，重发即被拒绝。这不是数据被改写，是契约与 schema 演进相撞。
 // 所以增量刷新必须按自增 id 只取**新行**，绝不重发老行：老行在库里是当时那份快照，
 // 让它保持原样，比用新形状覆盖它更诚实。
-const turnWhere = [];
-const turnParams = [];
-if (since) { turnWhere.push("date(started_at / 1000, 'unixepoch') >= ?"); turnParams.push(since); }
-if (afterId) { turnWhere.push("id > ?"); turnParams.push(Number(afterId)); }
-const turnSql = `select * from member_turn_events
-                 ${turnWhere.length ? `where ${turnWhere.join(" and ")}` : ""}
-                 order by id`;
-
-for (const row of db.prepare(turnSql).iterate(...turnParams)) {
+//
+// 判据（过滤器怎么选）在文件上半部的 `turnFilter()` 里，`--explain` 可以直接看。
+if (turn.by === "after-id" && since) {
+  // 说清楚谁生效，免得有人以为日历窗口还在兜底。
+  console.error(
+    `note: 传了 --after-id ${afterId}，明细按水位导（id > ${afterId}）；` +
+    `--since ${since} 只作用于日汇总——时钟窗口不是「哪些行还没吸收」的答案，` +
+    `连挂两天时它会静默跳过第一天。`
+  );
+}
+for (const row of db.prepare(turnSql).iterate(...turn.params)) {
   emit({ k: "turn", ...row });
 }
 
 // 日汇总也按 --since 收窄：增量刷新时没必要每次搬全部历史。
 // 投影端是 upsert（按 (driver, source, fleet, member, carrier, provider, model, day)
 // 求聚后覆盖），所以只导最近几天是安全的、幂等的。
-const dailySql = since
-  ? `select * from member_turn_daily where day >= ? order by day, member_id`
-  : `select * from member_turn_daily order by day, member_id`;
 for (const row of db.prepare(dailySql).iterate(...(since ? [since] : []))) {
   emit({ k: "daily", ...row });
 }

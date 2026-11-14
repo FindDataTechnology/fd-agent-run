@@ -56,7 +56,7 @@ copy_exporter() {
 
 POD=$(resolve_pod)
 if [ -z "$POD" ]; then
-  echo "FATAL: 在 $CTX/$NS 找不到 platform pod（label $POD_LABEL）" >&2
+  echo "FATAL: 在 $CTX/$NS 找不到 platform pod（label ${POD_LABEL}）" >&2
   exit 2
 fi
 echo "pod=$POD  since=$SINCE  apply=$APPLY"
@@ -88,8 +88,15 @@ fi
 
 # 导出器每次重新拷进去：pod 会重启（本会话实测一小时内两次），/tmp 里的东西不留。
 # 拷失败就等于没有导出器，直接停，别拿着上一次留下的旧脚本跑。
-if ! copy_exporter "$POD"; then
-  echo "FATAL: 无法把 export_platform.mjs 拷进 $POD（pod 刚重启？）" >&2
+#
+# **`${VAR}` 的花括号不是风格问题**：写成 `$POD` 紧跟一个全角左括号时，
+# macOS 自带的 bash 3.2 会把那个括号的首字节读进变量名 ⇒ `set -u` 当场 abort
+# （2026-11-14 实测：报 `POD?: unbound variable`，行号指向这里）。
+# 而这几处全在**失败分支**上，于是「pod 在重启」这个它本来要报告的情况，
+# 变成了一个看不懂的报错。本机 /opt/homebrew/bin/bash 不存在，定时作业也走 3.2
+# —— 不是个人环境问题。同类判据见 tests/test_shell_var_adjacent_multibyte.py。
+if ! copy_exporter "${POD}"; then
+  echo "FATAL: 无法把 export_platform.mjs 拷进 ${POD}（pod 刚重启？）" >&2
   exit 2
 fi
 
@@ -105,7 +112,7 @@ for cell in $CELLS; do
     sleep 3
   done
   if [ "$ready" -eq 0 ]; then
-    echo "  FAIL $cell: 拿不到可用 pod（label $POD_LABEL，试了 2 次）"; fail=1; continue
+    echo "  FAIL $cell: 拿不到可用 pod（label ${POD_LABEL}，试了 2 次）"; fail=1; continue
   fi
   # 该 cell 已吸收到的最大 seq → 只导更新的行。
   # 不这么做的话，表一加列就让**每一行**的指纹变化，投影器按契约拒绝重写历史
