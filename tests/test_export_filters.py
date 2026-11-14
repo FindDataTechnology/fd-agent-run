@@ -105,3 +105,68 @@ def test_meta_records_which_filter_won():
     assert re.search(r"^\s*turn_filter_by: turn\.by,", src, re.M), (
         "meta 行里没有 turn_filter_by：导出被过滤了，产物里却看不出来"
     )
+
+
+# ── 刷新心跳：把「读通了」与「有数据」分成两件事 ──────────────────────────
+
+
+class _FakeCur:
+    """只记录 SQL 与参数：心跳是**决策**，判据落在「写了什么」上。"""
+
+    def __init__(self):
+        self.calls: list[tuple[str, tuple]] = []
+
+    def execute(self, sql, params=()):
+        self.calls.append((sql, params))
+
+
+def test_heartbeat_marks_idle_when_nothing_new():
+    """零新增也必须留痕，且状态是 `idle`——否则一个安静的 cell 会被判成坏掉。"""
+    from fd_agent_run import projector
+
+    cur = _FakeCur()
+    projector._heartbeat(cur, "cell:abc", absorbed=0)
+    sql, params = cur.calls[0]
+    assert "agent_run_projection" in sql
+    assert projector.HEARTBEAT_RUN_ID == "__cell__"
+    assert params[0] == "cell:abc"
+    assert params[1] == "__cell__"
+    assert params[3] == "idle", "absorbed=0 时状态必须是 idle，不能冒充 ok"
+    assert "absorbed_at = now()" in sql, "冲突时要刷新时刻，否则心跳不会前进"
+
+
+def test_heartbeat_marks_ok_when_rows_arrived():
+    from fd_agent_run import projector
+
+    cur = _FakeCur()
+    projector._heartbeat(cur, "cell:abc", absorbed=7)
+    _sql, params = cur.calls[0]
+    assert params[2] == 7
+    assert params[3] == "ok"
+
+
+def test_heartbeat_id_is_not_a_run_id_shape():
+    """保留名必须不可能与真实 run_id 撞上。"""
+    from fd_agent_run import projector
+
+    assert projector.HEARTBEAT_RUN_ID.startswith("__")
+    assert projector.HEARTBEAT_RUN_ID.endswith("__")
+
+
+def test_project_platform_export_actually_calls_the_heartbeat():
+    """光有 `_heartbeat()` 不够——必须证明**每次真写都调用它**。
+
+    2026-11-14 实测过这个缺口：把调用那行删掉，全部测试仍然绿，因为其他用例只测
+    函数自身的行为。而少写一条心跳的后果是「安静的 cell 2 个周期后无故转红」，
+    正好是这条判据要消灭的东西。用 AST 查调用点，比 grep 文本稳（改格式不会假红）。
+    """
+    import ast
+
+    tree = ast.parse((ROOT / "fd_agent_run" / "projector.py").read_text(encoding="utf-8"))
+    fn = next((n for n in ast.walk(tree)
+               if isinstance(n, ast.FunctionDef) and n.name == "project_platform_export"),
+              None)
+    assert fn is not None, "projector.py 里没有 project_platform_export"
+    called = [n for n in ast.walk(fn)
+              if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "_heartbeat"]
+    assert called, "project_platform_export 没有调用 _heartbeat：安静承载者会无故转红"

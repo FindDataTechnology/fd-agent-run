@@ -501,10 +501,46 @@ def project_platform_export(path: Path, dsn: str, *, cell: str | None = None,
                 """,
                 projections,
             )
+            _heartbeat(cur, source, absorbed=stats["absorbed"])
             if daily:
                 _upsert_daily(cur, source, daily)
         conn.commit()
     return stats
+
+
+#: 心跳行的保留 `run_id`。它不是一次 run（`__unassigned__` 是先例：保留名字显式
+#: 表达「这里没有身份」），而是「这条链路在某时刻确实跑通了」这个事实。
+HEARTBEAT_RUN_ID = "__cell__"
+
+
+def _heartbeat(cur: Any, source: str, *, absorbed: int) -> None:
+    """记一条「本次刷新跑通了」的心跳，**哪怕一行新数据都没有**。
+
+    为什么必须有它：覆盖面板用 `max(absorbed_at)` 判新鲜度，而水位行只在**有新增
+    行**时才更新。于是一个「确实在被读、但这两天没有新回合」的 cell 会在 2 个周期后
+    被判 `stale`——红的是一个没毛病的东西（2026-11-14 实测：`cell:de7ec3a69617c6e0`
+    历史上只有 1 次 run、`cell:6db2b1b4b490223b` 两天无新回合，两个都会在
+    11-15 18:18Z / 11-16 02:00Z 同时翻红）。而那正是「闸常年红就会被无视」的起点。
+
+    两个事实分开记，因为它们是两种故障：
+      * `status='ok'` + `absorbed_count>0` → 有数据进来（正常）；
+      * `status='idle'` + `absorbed_count=0` → 读通了、只是没有新数据；
+      * 心跳本身变旧（> 2 个声明周期）→ **流水线断了**，这才是该红的。
+    面板据此把 `idle` 与 `stale` 分开，不再把「安静」当成「坏了」。
+    """
+    cur.execute(
+        """
+        INSERT INTO agent_runs.agent_run_projection
+            (driver, source, run_id, last_seq, last_hash, absorbed_count, status, absorbed_at)
+        VALUES ('platform', %s, %s, 0, NULL, %s, %s, now())
+        ON CONFLICT (driver, source, run_id) DO UPDATE
+          SET absorbed_count = EXCLUDED.absorbed_count,
+              status = EXCLUDED.status,
+              last_error = NULL,
+              absorbed_at = now()
+        """,
+        (source, HEARTBEAT_RUN_ID, absorbed, "ok" if absorbed else "idle"),
+    )
 
 
 def _upsert_daily(cur: Any, source: str, rows: list[dict[str, Any]]) -> None:
