@@ -67,6 +67,28 @@ class CrewAdapterTests(Base):
         self.assertEqual(fact["verdict"], "cancelled")
         self.assertEqual(fact["reason"], "human stop")
 
+    def test_explicit_empty_holder_reaches_the_validator(self) -> None:
+        """`"holder": ""` is the writer saying "nobody" — do not launder it to unknown.
+
+        `validate` refuses an empty owner for exactly this reason. The adapter used
+        to gate on truthiness, so the empty string vanished and the fact came out
+        `$unknown` (admissible): the rule was unreachable from this substrate.
+        """
+        path = self.journal([
+            {"kind": "task_state", "task": "a", "state": "pending", "holder": ""},
+        ])
+        fact = ad.from_crew_journal(path)[0]
+        self.assertEqual(fact["owner"], "")
+        problems = validate(fact)
+        self.assertTrue(any("owner is empty" in p for p in problems), problems)
+
+    def test_absent_holder_is_still_unknown(self) -> None:
+        """The pair for the test above: no key means "not looked", which is fine."""
+        path = self.journal([{"kind": "task_state", "task": "a", "state": "pending"}])
+        fact = ad.from_crew_journal(path)[0]
+        self.assertTrue(is_unknown(fact["owner"]))
+        self.assertEqual(validate(fact), [])
+
     def test_missing_file_is_empty_not_an_exception(self) -> None:
         self.assertEqual(ad.from_crew_journal(self.tmp / "nope.jsonl"), [])
 

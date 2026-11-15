@@ -81,7 +81,16 @@ def from_crew_journal(journal_path: Path) -> list[dict[str, Any]]:
             fact["at"] = event["t"]
         if isinstance(event.get("attempt"), int):
             fact["attempt"] = event["attempt"]
-        if event.get("holder"):
+        if isinstance(event.get("holder"), str):
+            # Pass the recorded holder through **verbatim, including the empty
+            # string**. `"holder": ""` is the writer saying "nobody", and
+            # `fact.validate` refuses it precisely because empty reads as
+            # "nobody" while `$unknown` reads as "not looked". Truthiness here
+            # (`if event.get("holder")`) dropped the empty string, so the fact
+            # came out `$unknown` — admissible — and that rule could never fire
+            # from this substrate. That is an adapter improving its input, the
+            # one thing this module must not do.
+            # A missing key (or an explicit null) still means "not looked".
             fact["owner"] = event["holder"]
         if isinstance(event.get("predicate"), dict):
             # Keep whatever the ledger recorded. If it has no `declared_at`, the
