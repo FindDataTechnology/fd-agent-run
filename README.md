@@ -169,6 +169,53 @@ EXIT=2 判不出——「什么都没查」不许读成「一个缺口都没有�
 读者要各自过滤它：水位查询按 `(driver, source, run_id)` 精确匹配，天然不受影响；
 统计 run 数时排除它（`count(*) filter (where run_id <> '__cell__')`）。
 
+## 保留策略：谁按 `retention_policy` 删明细（`retain`）
+
+`sql/001` 从第一版就把保留策略声明成一张表（`windowed` = 超 90 天 **且** 超每承载者
+最近 500 条才删）。而到 2026-11-15 为止**全仓没有任何 deleter** —— 声明在库里、
+没有任何东西执行，也没有任何通道会因为「它没执行」而变红：`可删 0 行` 与
+`判据恒假` 在每一处输出上都长得一样。
+
+```bash
+# 默认只读：报策略、行数、可删行数、执行器最近一次的结果
+python3 -m fd_agent_run.cli retain
+
+# 只有在确认判据与授权都没问题之后才加 --apply（真删，无 undo）
+python3 -m fd_agent_run.cli retain --apply
+
+# 证明判据真的会点火（只能空跑；与 --apply 互斥）
+python3 -m fd_agent_run.cli retain --what-if-period-days 0
+python3 -m fd_agent_run.cli retain --what-if-period-days 0 --what-if-keep 100
+```
+
+判据只认策略表与库结构，**不认表名清单**：带 `retention_class` 列的表由
+`information_schema` 发现，期限与保留条数从 `retention_policy` 读。有表落在有期限
+分级上却没登记「怎么算承载者」时，`--apply` **拒绝运行**并点名要补哪条登记 ——
+那种表在删除侧与永久表一模一样，是这条链唯一的静默盲区来源。
+
+三种情况一律**拒绝**且退出码非零，绝不报「本次删除 0 行」：缺 pruner 登记、
+角色没有 DELETE 权限、可删行数 > 0 而实际删了 0 行。最后一条尤其要紧：权限不足、
+`WHERE` 恒假、事务被回滚三种成因在这里同形，而它们写出来的日志与「确实没有超期行」
+一字不差。
+
+`--apply` 还会写心跳（`~/.local/state/fd-agent-run/retention.json`，`FD_RETENTION_HEARTBEAT`
+可覆盖），**被拒时也写** —— 看板侧的「为什么没删」只能引用执行器自己这句话，因为
+从审计侧用 `has_table_privilege('别的角色', …)` 去探权限，对看不见的角色返回的是
+`false` 而不是报错（那会把「我看不见」写成「它没有」）。一次性运行加 `--no-heartbeat`，
+别让手工运行冒充排期运行。
+
+**当前的阻塞点（2026-11-15 实测）**：唯一可写角色 `fd_agent_run_projector` 只有
+schema USAGE + INSERT/UPDATE，**没有 DELETE**（也没有 CREATE，所以建表类迁移只能由
+别的角色做）。要真正开始剪枝，由有授权能力的角色执行一次：
+
+```sql
+GRANT DELETE ON agent_runs.agent_run_event TO fd_agent_run_projector;
+```
+
+在授权之前**不要**把它挂进 `tools/refresh_platform.sh`：那会让「吸收成功」与
+「保留被拒」共用同一个退出码，并给每日作业造一道永远红的闸。板面照实报告
+（`retention` 那条判据），不靠作业跑没跑来判。
+
 ### 顺带自证：cell 的日汇总自己是否对得上（`tools/check_cell_daily.mjs`）
 
 ```bash
