@@ -95,8 +95,20 @@ fi
 # 而这几处全在**失败分支**上，于是「pod 在重启」这个它本来要报告的情况，
 # 变成了一个看不懂的报错。本机 /opt/homebrew/bin/bash 不存在，定时作业也走 3.2
 # —— 不是个人环境问题。同类判据见 tests/test_shell_var_adjacent_multibyte.py。
-if ! copy_exporter "${POD}"; then
-  echo "FATAL: 无法把 export_platform.mjs 拷进 ${POD}（pod 刚重启？）" >&2
+# **首次拷贝也要重试**：pod 重启窗口里 `kubectl cp` 会连续失败十几秒，而这一次失败
+# 会让整轮空跑——2026-11-15 00:10Z 的定时轮就是这样（FATAL 后 exit 2，一整天没数据）。
+# 当时它还是**完全静默**的：wrapper 那行 `echo "[$(date)] exit=$?"` 读的是 `date` 的
+# 状态（命令替换把 `$?` 覆盖了），所以日志里写着 exit=0。两处都已修。
+copied=0
+for attempt in 1 2 3; do
+  if copy_exporter "${POD}"; then copied=1; break; fi
+  sleep 3
+  POD=$(resolve_pod)
+  if [ -z "$POD" ]; then break; fi
+  echo "  第 $attempt 次拷贝导出器失败，重试（pod=$POD）"
+done
+if [ "$copied" -eq 0 ]; then
+  echo "FATAL: 无法把 export_platform.mjs 拷进 ${POD:-无 pod}（试了 3 次，pod 在重启？）" >&2
   exit 2
 fi
 
