@@ -764,6 +764,111 @@ def cmd_project(args: argparse.Namespace) -> int:
     return 1 if refused else 0
 
 
+def _refuse(ret, args: argparse.Namespace, plan, reason: str) -> None:
+    """把「被拒」也写进心跳。
+
+    **看板没法自己判这件事**：它要能从 `has_table_privilege('别的角色', …)` 读出
+    「执行器没有 DELETE 权」，但那个函数对自己看不见的角色返回的是 **false 而不是
+    报错**（2026-11-15 实测：`fd_dashboards_ro` 问 `fd_agent_run_projector` 得到
+    `False`）。拿它当判据就是把「我看不见」写成「它没有」。所以理由只由执行器自己
+    报；看板引用原话，不猜。
+    """
+    if getattr(args, "no_heartbeat", False):
+        return
+    path = ret.default_heartbeat_path()
+    ret.write_heartbeat(path, {
+        "at": plan.generated_at,
+        "dry_run": False,
+        "refused": reason,
+        "eligible": plan.eligible,
+        "deleted": 0,
+        "tables": [t.as_dict() for t in plan.tables],
+    })
+    print(f"心跳：{path}（记录拒绝理由）")
+
+
+def cmd_retain(args: argparse.Namespace) -> int:
+    """按 `agent_runs.retention_policy` 清理明细行。默认只读。
+
+    退出码：0 = 已评估（或已按计划删除）；1 = **拒绝**（有表落在有期限分级上却没
+    登记 pruner，或缺 DELETE 授权）；2 = 配置/连接问题。
+
+    「拒绝」与「删了 0 行」必须能分开：前者要说清补什么，后者只有在确实没有超期行时
+    才成立。把两者混成一个 0，正是这条链此前「声明了却没人执行而无人察觉」的成因。
+    """
+    from . import retention as ret
+
+    try:
+        dsn = proj.dsn_from_env(args.dsn_env)
+    except proj.ProjectionError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    try:
+        import psycopg
+    except ImportError as exc:  # pragma: no cover - 环境问题，不是逻辑分支
+        print(f"error: retention needs psycopg ({exc})", file=sys.stderr)
+        return 2
+
+    with psycopg.connect(dsn, connect_timeout=10) as conn:
+        what_if = (args.what_if_period_days is not None or args.what_if_keep is not None)
+        if what_if and args.apply:
+            # what-if 改的是判据参数。让它与 --apply 同时成立，「删了多少」就再也
+            # 复算不出来——而删掉的明细行没有 undo。
+            print("error: --what-if-* 只能用于空跑（它改的是判据参数，不是执行参数）",
+                  file=sys.stderr)
+            return 2
+        plan = ret.plan(conn,
+                        what_if_period_days=args.what_if_period_days,
+                        what_if_keep=args.what_if_keep)
+        priv = ret.delete_privileges(conn)
+        denied = [r for r in priv if not r["can_delete"]]
+
+        if not args.apply:
+            for line in ret.render(plan, privileges=priv):
+                print(line)
+            print("----")
+            print(f"空跑：未删除任何行。可删合计 {plan.eligible} 行。要真删加 --apply。")
+            return 1 if (plan.blocked or denied) else 0
+
+        if plan.blocked:
+            for line in ret.render(plan, privileges=priv):
+                print(line)
+            _refuse(ret, args, plan, "有表落在有期限的保留分级上没有 pruner（见上行修法）")
+            print("REFUSED: 有表落在有期限的保留分级上没有 pruner，未执行删除", file=sys.stderr)
+            return 1
+        if denied:
+            # **不是**「删了 0 行」：这是执行入口本身不可用。单独一条路径、单独一个退出码。
+            for row in denied:
+                print(f"REFUSED: {row['role']} 对 {row['table']} 没有 DELETE 权限", file=sys.stderr)
+                print(f"  修法：{row['fix']}", file=sys.stderr)
+            _refuse(ret, args, plan, denied[0]["fix"])
+            return 1
+
+        try:
+            result = ret.apply_plan(conn, plan, batch=args.batch, max_rows=args.max_rows)
+        except (ret.RetentionRefused, ret.RetentionError) as exc:
+            print(f"REFUSED: {exc}", file=sys.stderr)
+            return 1
+        conn.commit()
+
+        payload = {
+            "at": plan.generated_at,
+            "dry_run": False,
+            "eligible": plan.eligible,
+            "deleted": result["deleted"],
+            "capped": result["capped"],
+            "tables": result["tables"],
+            "policy": [t.as_dict() for t in plan.tables],
+        }
+        if not args.no_heartbeat:
+            path = ret.default_heartbeat_path()
+            ret.write_heartbeat(path, payload)
+            print(f"心跳：{path}")
+        for line in ret.render(plan, privileges=priv, applied=result):
+            print(line)
+        return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="fd-agent-run", description="run ledger for multi-agent work")
     sub = ap.add_subparsers(dest="command", required=True)
@@ -854,6 +959,27 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_project)
+
+    p = sub.add_parser(
+        "retain",
+        help="apply agent_runs.retention_policy to detail rows (dry-run by default)",
+    )
+    p.add_argument("--apply", action="store_true",
+                   help="真删（默认只读）。需要角色有 DELETE 权限")
+    p.add_argument("--batch", type=int, default=500,
+                   help="每次 DELETE 的行数上限（短事务）")
+    p.add_argument("--max-rows", type=int, default=5000,
+                   help="单次运行最多删多少行（安全阀；判据写错时挡住整表清空）")
+    p.add_argument("--dsn-env", default="FD_AGENT_RUN_DSN",
+                   help="env var holding the connection string (never a literal)")
+    p.add_argument("--no-heartbeat", action="store_true",
+                   help="不写心跳产物（自证/复现时用，别让一次性运行冒充排期运行）")
+    p.add_argument("--what-if-period-days", type=int, default=None,
+                   help="空跑专用：把期限换成这个天数，用来证明年龄判据真的会点火")
+    p.add_argument("--what-if-keep", type=int, default=None,
+                   help="空跑专用：把每承载者保留条数换成这个值，用来证明名次判据会点火")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_retain)
 
     return ap
 
