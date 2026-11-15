@@ -181,3 +181,43 @@ def test_project_platform_export_actually_calls_the_heartbeat():
     called = [n for n in ast.walk(fn)
               if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "_heartbeat"]
     assert called, "project_platform_export 没有调用 _heartbeat：安静承载者会无故转红"
+
+
+# ── 承载者形状契约：`agent_source` 只收两种 source ─────────────────────────────
+# 2026-11-13 生产库里出现了一条 ('p','p','p') 的登记行，任何代码路径都产生不出它
+# （`cell:<16-hex>` / `project:<名>@<主机>` 之外无他）——手工插入的，而此前没有
+# 任何东西会拒绝。它在覆盖面板上变成一个永远没有数据的幽灵租户，读者分不出它是
+# 「空租户」还是「打错字」。
+
+
+def test_validate_source_accepts_the_two_contract_shapes():
+    from fd_agent_run.projector import validate_source
+    assert validate_source("platform", "cell:1da519d4c1c0bf89") == (
+        "platform", "cell:1da519d4c1c0bf89")
+    assert validate_source("crew", "project:fd-fleet@Bruces-Mac-62.local") == (
+        "crew", "project:fd-fleet@Bruces-Mac-62.local")
+
+
+@pytest.mark.parametrize("driver,source", [
+    ("p", "p"),                                  # 生产里那条真实垃圾行
+    ("platform", "1da519d4c1c0bf89"),            # 把租户 id 当成了一个来源
+    ("platform", "cell:zzzz"),                   # 非 hex
+    ("crew", "cell:1da519d4c1c0bf89"),           # driver 与 source 前缀不匹配
+    ("platform", "project:fd-fleet@host"),       # 同上
+])
+def test_validate_source_refuses_anything_else(driver, source):
+    from fd_agent_run.projector import validate_source
+    with pytest.raises(ValueError):
+        validate_source(driver, source)
+
+
+def test_register_source_refuses_before_touching_the_database():
+    """校验必须在 SQL **之前**：先写进去再校验，库里就已经脏了。"""
+    from fd_agent_run import projector
+
+    class _Conn:
+        def cursor(self):  # pragma: no cover - 不该被调用
+            raise AssertionError("形状不合法时不许发出 SQL")
+
+    with pytest.raises(ValueError):
+        projector.register_source(_Conn(), driver="p", source="p")

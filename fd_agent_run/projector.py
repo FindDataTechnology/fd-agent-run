@@ -30,6 +30,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import socket
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -106,6 +107,33 @@ def run_key_for(driver: str, source: str, run_id: str) -> str:
     return f"{driver}|{source}|{run_id}"
 
 
+#: 承载者形状契约。**不是风格问题**：`agent_source` 的左边是「应该有什么」的声明，
+#: 一条形状不合法的行会在覆盖面板上变成一个永远没有数据的幽灵租户，而读者无从判断
+#: 它是「空租户」还是「打错字」。2026-11-13 生产库里就出现了一条 `('p','p','p')`
+#: ——任何代码路径都产生不出它（`cell:<hex>` / `project:<name>@<host>` 两种之外无他），
+#: 是手工插入的，而此前没有任何东西会拒绝它。
+_DRIVERS = ("platform", "crew")
+_CELL_RE = re.compile(r"^cell:[0-9a-f]{8,}$")
+_PROJECT_RE = re.compile(r"^project:.+@.+$")
+
+
+def validate_source(driver: str, source: str) -> tuple[str, str]:
+    """校验并归一化 (driver, source)；不合法就抛，不静默登记。"""
+    d = (driver or "").strip()
+    s = (source or "").strip()
+    if d not in _DRIVERS:
+        raise ValueError(
+            f"未知 driver {driver!r}；只允许 {_DRIVERS}（见 _DRIVERS）")
+    if d == "platform" and not _CELL_RE.match(s):
+        raise ValueError(
+            f"platform 的 source 必须是 'cell:<16-hex 租户 id>'，收到 {source!r}"
+            f"——可能是把 pod 名/租户短名当成了 source")
+    if d == "crew" and not _PROJECT_RE.match(s):
+        raise ValueError(
+            f"crew 的 source 必须是 'project:<仓名>@<主机>'，收到 {source!r}")
+    return d, s
+
+
 def register_source(conn: Any, *, driver: str, source: str, label: str = "",
                     expected_period_seconds: int | None = None) -> None:
     """Declare a holder before it has ever projected.
@@ -114,6 +142,7 @@ def register_source(conn: Any, *, driver: str, source: str, label: str = "",
     contains projections — the coverage panel's left side has to be a declaration,
     or it silently omits the case it exists for.
     """
+    driver, source = validate_source(driver, source)
     with conn.cursor() as cur:
         cur.execute(
             """

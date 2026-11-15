@@ -105,7 +105,7 @@ for attempt in 1 2 3; do
   sleep 3
   POD=$(resolve_pod)
   if [ -z "$POD" ]; then break; fi
-  echo "  第 $attempt 次拷贝导出器失败，重试（pod=$POD）"
+  echo "  第 ${attempt} 次拷贝导出器失败，重试（pod=${POD}）"
 done
 if [ "$copied" -eq 0 ]; then
   echo "FATAL: 无法把 export_platform.mjs 拷进 ${POD:-无 pod}（试了 3 次，pod 在重启？）" >&2
