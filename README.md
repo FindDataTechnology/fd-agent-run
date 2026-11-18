@@ -1,5 +1,7 @@
 # fd-agent-run
 
+> **Part of the [Base line (寻数·壹座)](https://www.finddatatech.cloud/products/base) of [FindData](https://www.finddatatech.cloud)** — Agent run ledger and board — what an agent did, turn by turn, with a verifiable record.
+
 一次运行的任务台账。与 `fd-agent-graph` 互不依赖：那边判断**图是否自洽**，这边记录
 **运行走到哪了**。
 
