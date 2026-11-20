@@ -383,6 +383,7 @@ def project_platform_export(path: Path, dsn: str, *, cell: str | None = None,
     turns: dict[str, list[Row]] = {}
     unmapped_status: dict[str, int] = {}
     daily: list[dict[str, Any]] = []
+    claim_objects: list[dict[str, Any]] = []
     for obj in objects:
         kind = obj.get("k")
         if kind == "run":
@@ -411,10 +412,17 @@ def project_platform_export(path: Path, dsn: str, *, cell: str | None = None,
                 unmapped_status[str(status)] = unmapped_status.get(str(status), 0) + 1
         elif kind == "daily":
             daily.append(obj)
+        elif kind == "claim":
+            claim_objects.append(obj)
 
+    # One row per attempt, reduced to its LATEST picture: the export may carry
+    # the same turn_ref twice (a heartbeat between two passes) and the later
+    # observation is the same fact, further along.
+    claims = reduce_claims(claim_objects)
     stats: dict[str, Any] = {
         "cell": cell, "source": source, "runs": len(runs),
         "turns": sum(len(v) for v in turns.values()), "daily": len(daily),
+        "claims": len(claims),
         "absorbed": 0, "skipped": 0, "invalidated": [], "unmapped_status": unmapped_status,
         "dry_run": dry_run,
     }
@@ -533,7 +541,9 @@ def project_platform_export(path: Path, dsn: str, *, cell: str | None = None,
             _heartbeat(cur, source, absorbed=stats["absorbed"])
             if daily:
                 _upsert_daily(cur, source, daily)
+            claim_stats = _upsert_claims(cur, source, claims)
         conn.commit()
+    stats.update(claim_stats)
     return stats
 
 
@@ -570,6 +580,95 @@ def _heartbeat(cur: Any, source: str, *, absorbed: int) -> None:
         """,
         (source, HEARTBEAT_RUN_ID, absorbed, "ok" if absorbed else "idle"),
     )
+
+
+def reduce_claims(objects: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """The claim lane's reducer, PURE (no DB): one row per turn_ref, latest wins.
+
+    Testable without a database on purpose — the rule this function encodes is
+    the one the spec pins ("heartbeats do not grow the row count"), and a rule
+    only checkable by connecting to Postgres is a rule nobody re-checks.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for obj in objects:
+        if obj.get("k") != "claim":
+            continue
+        ref = obj.get("turn_ref")
+        if ref:
+            out[str(ref)] = obj
+    return out
+
+
+def _upsert_claims(cur: Any, source: str, claims: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Upsert the attempt facts and advance the CLAIM lane's own watermark.
+
+    Two rules, each with the failure it prevents:
+
+    * One row per ``turn_ref`` (upsert), never an append. Heartbeats arrive as
+      the same attempt further along; appending them would grow the table with
+      liveness instead of with attempts, and the "what is running" panel would
+      read a long turn as many.
+    * The watermark is the CLAIM lane's max(updated_at), stored under
+      lane='claim'. Sharing the turn lane's max(id) would let "results are
+      current" masquerade as "claims are current" — the two ride different
+      cursors on the cell side and one side's advance is not the other's.
+    """
+    stats: dict[str, Any] = {"claims_absorbed": 0}
+    if not claims:
+        return stats
+
+    def _ts(v: Any) -> Any:
+        return _parse_ts(v) if v is not None else None
+
+    rows = []
+    for ref, o in claims.items():
+        rows.append((
+            ref, o.get("driver") or "platform", source, o.get("run_id"), o.get("turn_id"),
+            o.get("fleet_id"), o.get("member_id"), o.get("session_id"),
+            o.get("carrier"), o.get("carrier_instance"),
+            _ts(o.get("started_at")), _ts(o.get("heartbeat_at")), _ts(o.get("lease_expires_at")),
+            _ts(o.get("closed_at")), o.get("close_reason"), o.get("cancelled_by"),
+            o.get("runtime_fingerprint"),
+        ))
+    cur.executemany(
+        """
+        INSERT INTO agent_runs.agent_turn_claim
+            (turn_ref, driver, source, run_id, turn_id, fleet_id, member_id, session_id,
+             carrier, carrier_instance, started_at, heartbeat_at, lease_expires_at,
+             closed_at, close_reason, cancelled_by, runtime_fingerprint, retention_class)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'permanent')
+        ON CONFLICT (turn_ref) DO UPDATE
+          SET heartbeat_at        = COALESCE(EXCLUDED.heartbeat_at, agent_runs.agent_turn_claim.heartbeat_at),
+              lease_expires_at    = COALESCE(EXCLUDED.lease_expires_at, agent_runs.agent_turn_claim.lease_expires_at),
+              closed_at           = COALESCE(EXCLUDED.closed_at, agent_runs.agent_turn_claim.closed_at),
+              close_reason        = COALESCE(EXCLUDED.close_reason, agent_runs.agent_turn_claim.close_reason),
+              cancelled_by        = COALESCE(EXCLUDED.cancelled_by, agent_runs.agent_turn_claim.cancelled_by),
+              runtime_fingerprint = COALESCE(agent_runs.agent_turn_claim.runtime_fingerprint, EXCLUDED.runtime_fingerprint),
+              projected_at        = now()
+        """,
+        rows,
+    )
+    stats["claims_absorbed"] = len(rows)
+    # The lane watermark: max(updated-ish) observed in THIS batch. We use the
+    # latest of the timestamps we carry (heartbeat > started) so a claim that
+    # only beat (never closed) still advances it.
+    cursor = max(
+        (int(v) for o in claims.values() for v in (o.get("heartbeat_at"), o.get("started_at")) if v is not None),
+        default=None,
+    )
+    cur.execute(
+        """
+        INSERT INTO agent_runs.agent_claim_projection
+            (driver, source, lane, last_cursor, absorbed_count, status, absorbed_at)
+        VALUES ('platform', %s, 'claim', %s, %s, 'ok', now())
+        ON CONFLICT (driver, source, lane) DO UPDATE
+          SET last_cursor = GREATEST(COALESCE(EXCLUDED.last_cursor, 0), COALESCE(agent_runs.agent_claim_projection.last_cursor, 0)),
+              absorbed_count = agent_runs.agent_claim_projection.absorbed_count + EXCLUDED.absorbed_count,
+              status = 'ok', last_error = NULL, absorbed_at = now()
+        """,
+        (source, cursor, len(rows)),
+    )
+    return stats
 
 
 def _upsert_daily(cur: Any, source: str, rows: list[dict[str, Any]]) -> None:

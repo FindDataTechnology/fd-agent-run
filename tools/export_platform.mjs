@@ -56,6 +56,7 @@ const dbPath = arg("db", `/data/cells/${cell}/data/data/fleets.db`);
 const outPath = arg("out");
 const since = arg("since");       // 起始日（YYYY-MM-DD），按 started_at 的 UTC 日
 const afterId = arg("after-id");  // 只导 id > N 的明细：增量刷新用，见下
+const claimSince = arg("claim-since");  // claim 水位（updated_at 毫秒），与 turn 的 id 水位分开
 
 // ── 两把过滤器谁说了算（这是本文件唯一的判据，单独抽出来以便复核）──────────
 // **水位优先，时钟窗口退位**。原因是一条真实的丢数路径：
@@ -81,6 +82,15 @@ const turn = turnFilter();
 // 聚合，cell 侧 NULL 维度在那边是不同的行、在这里合并成一行。要验完整性就用
 // `sum(turns)` 与 `min/max(day)`，不要数行数（我第一版就是数行数，误报过一次）。
 const dailySql = `select * from member_turn_daily order by day, member_id`;
+// Claims (harden-agent-runtime-spine 6.1). Two facts make this cursor DIFFERENT
+// from the turn cursor and they must not be shared:
+//   • a claim is UPDATED while it lives (heartbeat, terminal close), so its
+//     AUTOINCREMENT-free key is `turn_ref` and `updated_at` moves;
+//   • the turn cursor is "id > N" on an append-only table, which is meaningless
+//     here (nothing is appended after the close).
+// So claims ride their own watermark over `updated_at` and their own meta key;
+// sharing one with turns would make one side's advance read as the other's gap.
+const claimSql = `select * from turn_claims ${claimSince ? "where updated_at > ?" : ""} order by updated_at`;
 const turnSql = `select * from member_turn_events
                  ${turn.sql ? `where ${turn.sql}` : ""}
                  order by id`;
@@ -99,6 +109,7 @@ if (process.argv.includes("--explain")) {
     cell, db_path: dbPath, since: since || null, after_id: afterId ? Number(afterId) : null,
     turn_filter_by: turn.by, turn_sql: turnSql, turn_params: turn.params,
     daily_sql: dailySql, daily_params: [], daily_filter_by: "full",
+    claim_sql: claimSql, claim_params: claimSince ? [Number(claimSince)] : [], claim_filter_by: claimSince ? "updated-at" : "full",
     partial: Boolean(since || afterId),
   }, null, 1));
   process.exit(0);
@@ -136,6 +147,15 @@ emit({
   // 是因为 stderr 上的提示只在失败时才被人看见——而「这份导出跳过了一部分行」
   // 这件事，事后复核的人必须能从产物里读出来，不能靠猜。
   turn_filter_by: turn.by,
+  // Claim cursor (harden-agent-runtime-spine 6.1): a SEPARATE watermark from
+  // the turn id cursor — see the claimSql comment. Recorded in the export so a
+  // reviewer can tell "this batch carried no new claims" from "claims were not
+  // exported at all".
+  claim_since: claimSince ? Number(claimSince) : null,
+  claim_filter_by: claimSince ? "updated-at" : "full",
+  // `claims` may be absent on an old cell whose DB predates the table; say so
+  // rather than writing 0 (a 0 would read as "the table exists and is empty").
+  has_claims: (() => { try { return Boolean(db.prepare("select 1 from sqlite_master where type='table' and name='turn_claims'").get()); } catch { return false; } })(),
 });
 
 for (const row of db.prepare(
@@ -170,6 +190,25 @@ for (const row of db.prepare(turnSql).iterate(...turn.params)) {
 // 求聚后覆盖），所以只导最近几天是安全的、幂等的。
 for (const row of db.prepare(dailySql).iterate()) {
   emit({ k: "daily", ...row });
+}
+
+// Claims last (6.1): they are the "did this attempt exist" lane, and exporting
+// them after the measured rows keeps a reader who streams the file able to
+// join a result row to its claim with no second pass.
+try {
+  const hasClaims = db.prepare("select 1 from sqlite_master where type='table' and name='turn_claims'").get();
+  if (hasClaims) {
+    const stmt = db.prepare(claimSql);
+    for (const row of claimSince ? stmt.iterate(Number(claimSince)) : stmt.iterate()) {
+      emit({ k: "claim", ...row });
+    }
+  }
+} catch (e) {
+  // An unreadable claim table must be VISIBLE, not silently skipped: the
+  // projector's gap check is what turns this into a red, and a silent skip
+  // would make the gap look like "the cell has no claims".
+  console.error(`FATAL: claim export failed: ${e.message}`);
+  process.exitCode = 1;
 }
 
 if (outPath) {
