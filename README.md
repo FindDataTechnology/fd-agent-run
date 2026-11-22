@@ -214,6 +214,17 @@ schema USAGE + INSERT/UPDATE，**没有 DELETE**（也没有 CREATE，所以建�
 GRANT DELETE ON agent_runs.agent_run_event TO fd_agent_run_projector;
 ```
 
+**待应用迁移（2026-11-23）**：`sql/006_turn_claims.sql`（`agent_turn_claim` +
+`agent_claim_projection` 两表）在生产 `agent_runs` schema 里**尚未应用**——投影器
+每轮报 `relation "agent_runs.agent_turn_claim" does not exist`，agent-runs 板因此读不到
+claim 面、再生作业 exit 1。同样是「建表类迁移只能由有 DDL 权限的角色做」，由该角色执行一次：
+
+```bash
+psql "$DDL_DSN" -f sql/006_turn_claims.sql   # 全 CREATE IF NOT EXISTS，幂等，可重跑
+```
+
+应用后 `python3 -m fd_agent_run ... project` 即可写入 claim 面。
+
 在授权之前**不要**把它挂进 `tools/refresh_platform.sh`：那会让「吸收成功」与
 「保留被拒」共用同一个退出码，并给每日作业造一道永远红的闸。板面照实报告
 （`retention` 那条判据），不靠作业跑没跑来判。
