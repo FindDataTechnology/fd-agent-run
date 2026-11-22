@@ -85,12 +85,20 @@ const dailySql = `select * from member_turn_daily order by day, member_id`;
 // Claims (harden-agent-runtime-spine 6.1). Two facts make this cursor DIFFERENT
 // from the turn cursor and they must not be shared:
 //   • a claim is UPDATED while it lives (heartbeat, terminal close), so its
-//     AUTOINCREMENT-free key is `turn_ref` and `updated_at` moves;
+//     AUTOINCREMENT-free key is `turn_ref` and its watermark moves;
 //   • the turn cursor is "id > N" on an append-only table, which is meaningless
 //     here (nothing is appended after the close).
-// So claims ride their own watermark over `updated_at` and their own meta key;
-// sharing one with turns would make one side's advance read as the other's gap.
-const claimSql = `select * from turn_claims ${claimSince ? "where updated_at > ?" : ""} order by updated_at`;
+// So claims ride their own watermark and their own meta key; sharing one with
+// turns would make one side's advance read as the other's gap.
+//
+// 水位列是 `heartbeat_at`（不是 `updated_at`）：cell 的 turn_claims
+// （paas/lib/turn-claim-store.js DDL）只有 started_at/heartbeat_at/lease_expires_at/
+// closed_at，**没有 updated_at**。旧版本按 updated_at 查询，会让任何有 claim 的
+// cell 导出直接 `no such column: updated_at` 而 FAIL（2026-11-23 实测 agent-runs
+// 板一直停在 11-21）。心跳是 claim 存续期最频繁的写入，用它当水位最贴近「这条变了」；
+// COALESCE 兜住从未心跳（只写 started_at）的行。
+const claimStamp = "COALESCE(heartbeat_at, started_at)";
+const claimSql = `select * from turn_claims ${claimSince ? `where ${claimStamp} > ?` : ""} order by ${claimStamp}`;
 const turnSql = `select * from member_turn_events
                  ${turn.sql ? `where ${turn.sql}` : ""}
                  order by id`;
@@ -109,7 +117,7 @@ if (process.argv.includes("--explain")) {
     cell, db_path: dbPath, since: since || null, after_id: afterId ? Number(afterId) : null,
     turn_filter_by: turn.by, turn_sql: turnSql, turn_params: turn.params,
     daily_sql: dailySql, daily_params: [], daily_filter_by: "full",
-    claim_sql: claimSql, claim_params: claimSince ? [Number(claimSince)] : [], claim_filter_by: claimSince ? "updated-at" : "full",
+    claim_sql: claimSql, claim_params: claimSince ? [Number(claimSince)] : [], claim_filter_by: claimSince ? "heartbeat-at" : "full",
     partial: Boolean(since || afterId),
   }, null, 1));
   process.exit(0);
@@ -152,7 +160,7 @@ emit({
   // reviewer can tell "this batch carried no new claims" from "claims were not
   // exported at all".
   claim_since: claimSince ? Number(claimSince) : null,
-  claim_filter_by: claimSince ? "updated-at" : "full",
+  claim_filter_by: claimSince ? "heartbeat-at" : "full",
   // `claims` may be absent on an old cell whose DB predates the table; say so
   // rather than writing 0 (a 0 would read as "the table exists and is empty").
   has_claims: (() => { try { return Boolean(db.prepare("select 1 from sqlite_master where type='table' and name='turn_claims'").get()); } catch { return false; } })(),

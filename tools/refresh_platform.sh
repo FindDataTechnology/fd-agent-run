@@ -46,8 +46,12 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 # 多 cell 跑到一半时换掉的那次，剩下的 cell 全打在已死的 pod 上。所以**每个 cell 前
 # 重新解析**，并重新拷导出器（/tmp 里的东西不跨 pod 存活）。
 resolve_pod() {
+  # 取 Running 且已调度（有 host）的 pod：滚动更新时 Pending 的新 pod 会短暂排在
+  # items[0]，对它 exec 报「does not have a host assigned」并让整轮 exit 2（2026-11-22 实测）。
   kubectl --context "$CTX" -n "$NS" get pods -l "$POD_LABEL" \
-    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null
+    --field-selector=status.phase=Running \
+    -o jsonpath='{range .items[?(@.spec.nodeName)]}{.metadata.name}{"\n"}{end}' 2>/dev/null \
+    | head -1
 }
 copy_exporter() {
   kubectl --context "$CTX" -n "$NS" cp "$HERE/export_platform.mjs" \
